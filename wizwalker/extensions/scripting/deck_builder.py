@@ -303,7 +303,7 @@ class DeckBuilder:
                     continue
                 await template.name()
                 list_of_valid_spell_entries.append(spell)
-            except:
+            except Exception:
                 pass
         return list_of_valid_spell_entries
 
@@ -325,7 +325,7 @@ class DeckBuilder:
                     continue
                 await template.name()
                 list_of_valid_spell_entries.append(spell)
-            except:
+            except Exception:
                 pass
         return list_of_valid_spell_entries
 
@@ -547,7 +547,7 @@ class DeckBuilder:
                 elif valid_graphical_spell == 0 or valid_graphical_spell == 3:
                     if not await graphical.maybe_read_type_name() == '':
                         list_of_deck_spell_graphicals.append(graphical)
-            except:
+            except Exception:
                 pass
         return list_of_deck_spell_graphicals
 
@@ -579,7 +579,7 @@ class DeckBuilder:
             leftButton = await _maybe_get_named_window(message_box_modal_window, "leftButton")
             async with self.client.mouse_handler:
                 await self.client.mouse_handler.click_window(leftButton)
-        except:
+        except Exception:
             number_of_cards = await self.get_deck_count()
             if number_of_cards == 0:
                 return
