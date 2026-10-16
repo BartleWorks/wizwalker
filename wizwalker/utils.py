@@ -3,6 +3,7 @@ import ctypes
 import ctypes.wintypes
 import io
 import math
+import os
 import struct
 import subprocess
 import contextlib
@@ -11,7 +12,7 @@ import contextlib
 import winreg
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Optional, Union
 
 import appdirs
 
@@ -506,13 +507,33 @@ async def maybe_wait_for_any_value_with_timeout(
         )
 
 
+_CACHE_FOLDER_OVERRIDE = None
+
+
+def override_cache_folder(path: Optional[Union[str, os.PathLike]]):
+    """
+    Override the folder returned by get_cache_folder
+
+    Call it before a CacheHandler first reads its cache: each one keeps the
+    folder it found then.
+
+    Args:
+        path: The folder to use instead, or None for the default
+    """
+    global _CACHE_FOLDER_OVERRIDE
+    _CACHE_FOLDER_OVERRIDE = path
+
+
 def get_cache_folder() -> Path:
     """
     Get the wizwalker cache folder
     """
-    app_name = "WizWalker"
-    app_author = "StarrFox"
-    cache_dir = Path(appdirs.user_cache_dir(app_name, app_author))
+    if _CACHE_FOLDER_OVERRIDE:
+        cache_dir = Path(_CACHE_FOLDER_OVERRIDE).absolute()
+    else:
+        app_name = "WizWalker"
+        app_author = "StarrFox"
+        cache_dir = Path(appdirs.user_cache_dir(app_name, app_author))
 
     cache_dir.mkdir(parents=True, exist_ok=True)
 
