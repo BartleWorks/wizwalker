@@ -5,6 +5,7 @@ from contextlib import suppress
 from loguru import logger
 
 from wizwalker.memory.memory_object import (
+    MAX_STRING,
     WIDE_BUF_CHARS,
     Primitive,
     DynamicMemoryObject,
@@ -178,7 +179,8 @@ class Window(PropertyClass):
 
         base_address = await self.read_base_address() + offset
         string_len = await self.read_typed(base_address + 16, Primitive.int32)
-        if string_len == 0:
+        # Bounded as read_string is; see read_wide_string.
+        if not 1 <= string_len <= MAX_STRING:
             return ""
 
         # NOT always a pointer: while the string's capacity still fits MSVC's inline
@@ -205,38 +207,9 @@ class Window(PropertyClass):
             offset = 712
 
         address = await self.read_base_address() + offset
-        string_len_addr = address + 16
-        encoded = text.encode("utf-16-le")
-        # len(encoded) instead of string bc it can be larger in some encodings
-        string_len = len(encoded)
-
-        current_string_len = await self.read_typed(address + 16, Primitive.int32)
-
-        # we need to create a pointer to the string data
-        #if string_len >= 7 > current_string_len:
-        #    # +1 for 0 byte after
-        #    pointer_address = await self.allocate(string_len + 1)
-
-            # need 0 byte for some c++ null termination standard
-        #   await self.write_bytes(pointer_address, encoded + b"\x00")
-        #    await self.write_typed(address, pointer_address, Primitive.int64)
-
-        # string is already a pointer
-        #elif string_len >= 7 and current_string_len >= 8:
-        
-        
-        # Assume Maybe Text is always a Pointer
-        
-        pointer_address = await self.read_typed(address, Primitive.int64)
-        await self.write_bytes(pointer_address, encoded + b"\x00")
-
-        # normal buffer string
-        #else:
-        #    await self.write_bytes(address, encoded + b"\x00")
-
-        # take 2 bytes
-        await self.write_typed(string_len_addr, string_len // 2, Primitive.int32)
-        #await self.write_wide_string_to_offset(584, text)
+        # Not always a pointer, as maybe_text explains, and a pointer's buffer can be
+        # shorter than the new text: _write_basic_string checks both.
+        await self.write_wide_string(address, text)
 
     async def name(self) -> str:
         return await self.read_string_from_offset(80)

@@ -93,7 +93,9 @@ class MemoryObject(MemoryReader):
 
     async def read_wide_string(self, address: int, encoding: str = "utf-16") -> str:
         string_len = await self.read_typed(address + 16, Primitive.int32)
-        if string_len == 0:
+        # Bounded as read_string is: a stale or wrong address can hold any length,
+        # and pymem allocates a buffer of whatever size it is asked for.
+        if not 1 <= string_len <= MAX_STRING:
             return ""
 
         string_address = await self._string_data_address(address, WIDE_BUF_CHARS)
@@ -139,36 +141,48 @@ class MemoryObject(MemoryReader):
         base_address = await self.read_base_address()
         return await self.read_wide_string(base_address + offset, encoding)
 
-    async def write_wide_string(
-        self, address: int, string: str, encoding: str = "utf-16"
+    async def _write_basic_string(
+        self, address: int, encoded: bytes, char_size: int, buf_chars: int
     ):
-        string_len_addr = address + 16
-        encoded = string.encode(encoding)
-        # len(encoded) instead of string bc it can be larger in some encodings
-        string_len = len(encoded)
+        """Write `encoded` into the MSVC std::basic_string at `address`.
 
-        current_string_len = await self.read_typed(address + 16, Primitive.int32)
+        See _string_data_address for the layout. Capacity decides where the
+        characters go, as it does when reading: inline while the string still fits
+        the 16-byte buffer, else the heap buffer the union points at. A string that
+        outgrows its current room gets a new buffer, and the capacity is updated with
+        it, so the next read finds the pointer rather than reading it as characters.
 
-        # we need to create a pointer to the string data
-        if string_len >= 7 > current_string_len:
-            # +1 for 0 byte after
-            pointer_address = await self.allocate(string_len + 1)
+        That buffer is allocated with VirtualAllocEx, not the game's heap. The game
+        may later try to free it with its own allocator, so a write that grows a
+        string is best kept to strings the game does not free.
+        """
+        length = len(encoded) // char_size
+        terminated = encoded + b"\x00" * char_size
+        capacity = await self.read_typed(address + 24, Primitive.uint64)
 
-            # need 0 byte for some c++ null termination standard
-            await self.write_bytes(pointer_address, encoded + b"\x00")
-            await self.write_typed(address, pointer_address, Primitive.int64)
-
-        # string is already a pointer
-        elif string_len >= 7 and current_string_len >= 8:
-            pointer_address = await self.read_typed(address, Primitive.int64)
-            await self.write_bytes(pointer_address, encoded + b"\x00")
-
-        # normal buffer string
+        if capacity >= buf_chars and length <= capacity:
+            # a heap buffer already, with room
+            data_address = await self.read_typed(address, Primitive.int64)
+            await self.write_bytes(data_address, terminated)
+        elif capacity < buf_chars and length < buf_chars:
+            # inline, and still fits
+            await self.write_bytes(address, terminated)
         else:
-            await self.write_bytes(address, encoded + b"\x00")
+            data_address = await self.allocate(len(terminated))
+            await self.write_bytes(data_address, terminated)
+            await self.write_typed(address, data_address, Primitive.int64)
+            await self.write_typed(address + 24, length, Primitive.uint64)
 
-        # take 2 bytes
-        await self.write_typed(string_len_addr, string_len // 2, Primitive.int32)
+        await self.write_typed(address + 16, length, Primitive.uint64)
+
+    async def write_wide_string(
+        self, address: int, string: str, encoding: str = "utf-16-le"
+    ):
+        # Plain "utf-16" prepends a byte order mark, which the game would show as a
+        # character; the game's own strings carry none.
+        if encoding.lower().replace("_", "-") in ("utf-16", "utf16"):
+            encoding = "utf-16-le"
+        await self._write_basic_string(address, string.encode(encoding), 2, WIDE_BUF_CHARS)
 
     async def write_wide_string_to_offset(
         self, offset: int, string: str, encoding: str = "utf-16"
@@ -196,32 +210,7 @@ class MemoryObject(MemoryReader):
         return await self.read_string(base_address + offset, encoding)
 
     async def write_string(self, address: int, string: str, encoding: str = "utf-8"):
-        string_len_addr = address + 16
-        encoded = string.encode(encoding)
-        # len(encoded) instead of string bc it can be larger in some encodings
-        string_len = len(encoded)
-
-        current_string_len = await self.read_typed(address + 16, Primitive.int32)
-
-        # we need to create a pointer to the string data
-        if string_len >= 15 > current_string_len:
-            # +1 for 0 byte after
-            pointer_address = await self.allocate(string_len + 1)
-
-            # need 0 byte for some c++ null termination standard
-            await self.write_bytes(pointer_address, encoded + b"\x00")
-            await self.write_typed(address, pointer_address, Primitive.int64)
-
-        # string is already a pointer
-        elif string_len >= 15 and current_string_len >= 15:
-            pointer_address = await self.read_typed(address, Primitive.int64)
-            await self.write_bytes(pointer_address, encoded + b"\x00")
-
-        # normal buffer string
-        else:
-            await self.write_bytes(address, encoded + b"\x00")
-
-        await self.write_typed(string_len_addr, string_len, Primitive.int32)
+        await self._write_basic_string(address, string.encode(encoding), 1, NARROW_BUF_CHARS)
 
     async def write_string_to_offset(
         self, offset: int, string: str, encoding: str = "utf-8"
@@ -324,7 +313,7 @@ class MemoryObject(MemoryReader):
         return pointers
 
     async def read_dynamic_vector(
-        self, offset: int, data_type: Primitive = Primitive.int64
+        self, offset: int, data_type: Primitive = Primitive.int64, *, max_size: int = 10_000
     ) -> List[int]:
         """
         Read a vector that changes in size
@@ -337,8 +326,11 @@ class MemoryObject(MemoryReader):
 
         size = (end_address - start_address) // size_per_type
 
-        if size == 0:
+        if size <= 0:
             return []
+
+        if size > max_size:
+            raise ValueError(f"Size was {size} and the max was {max_size}")
 
         current_address = start_address
         pointers = []
@@ -354,11 +346,18 @@ class MemoryObject(MemoryReader):
             offset: int,
             object_size: int,
             object_type: type,
+            *,
+            max_size: int = 10_000,
     ):
         start = await self.read_value_from_offset(offset, Primitive.uint64)
         end = await self.read_value_from_offset(offset + 8, Primitive.uint64)
 
         total_size = (end - start) // object_size
+
+        # Nothing here reads the elements, so a stale vector holding garbage bounds
+        # would otherwise build millions of objects before anything failed.
+        if total_size > max_size:
+            raise ValueError(f"Size was {total_size} and the max was {max_size}")
 
         current_addr = start
 
@@ -434,11 +433,19 @@ class MemoryObject(MemoryReader):
         await self._get_std_map_children(first_node, mapped_type, mapped_return)
         return mapped_return
 
-    async def read_hashset_basic(self, offset: int, primitive_type: Primitive) -> set[int]:
+    async def read_hashset_basic(
+        self, offset: int, primitive_type: Primitive, *, max_size: int = 10_000
+    ) -> set[int]:
         result = set()
         root = DynamicMemoryObject(self.hook_handler, await self.read_value_from_offset(offset, Primitive.uint64))
         stack = [DynamicMemoryObject(self.hook_handler, await root.read_value_from_offset(8, Primitive.uint64))]
+        visited = 0
         while len(stack) > 0:
+            # A tree read mid-change can hold a cycle, and none of these reads
+            # suspends, so an unbounded walk would hold the event loop for good.
+            visited += 1
+            if visited > max_size:
+                raise ValueError(f"Set has more than {max_size} nodes; probably read mid-change")
             node = stack.pop()
             is_leaf = await node.read_value_from_offset(0x19, Primitive.bool)
             if is_leaf:
