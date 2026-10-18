@@ -265,10 +265,22 @@ class Client:
         """
         # if the client isn't running there isn't anything to unhook
         if not self.is_running():
+            self.release_process_handle()
             return
 
         await self._unpatch_movement_update()
         await self.hook_handler.close()
+
+    def release_process_handle(self):
+        """
+        Close the handle to the client's process, once the process has exited
+
+        The handle keeps the exited process's kernel object alive for as long as it
+        is open, and nothing else closes it. Reads afterwards raise ClientClosedError.
+        Safe to call more than once.
+        """
+        if self._pymem.process_handle:
+            self._pymem.close_process()
 
     async def get_template_ids(self) -> dict:
         """

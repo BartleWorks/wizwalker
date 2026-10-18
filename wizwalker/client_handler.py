@@ -81,6 +81,8 @@ class ClientHandler:
         dead_clients = []
         for client in clients_proxy:
             if not client.is_running():
+                # Nothing else closes it: each dead client leaked one process handle.
+                client.release_process_handle()
                 dead_clients.append(client)
                 self.clients.remove(client)
 

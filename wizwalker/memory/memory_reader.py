@@ -293,6 +293,9 @@ class MemoryReader:
 
         try:
             return self.process.read_bytes(address, size)
+        except pymem.exception.ProcessError:
+            # the handle was released once the process exited
+            raise ClientClosedError()
         except pymem.exception.MemoryReadError:
             # we don't want to run is running for every read
             # so we just check after we error
@@ -313,6 +316,9 @@ class MemoryReader:
 
         try:
             self.process.write_bytes(address, value, size)
+        except pymem.exception.ProcessError:
+            # see read_bytes
+            raise ClientClosedError()
         except pymem.exception.MemoryWriteError:
             # see read_bytes
             if not self.is_running():
