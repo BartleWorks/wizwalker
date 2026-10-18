@@ -22,6 +22,11 @@ from wizwalker import (
 )
 
 
+# Export tables by DLL path. A system DLL's exports are the same for every process,
+# so one table serves every client.
+_SYMBOL_TABLES: dict[str, dict[str, int]] = {}
+
+
 class MemoryReader:
     """
     Represents anything that needs to read/write from/to memory
@@ -29,8 +34,6 @@ class MemoryReader:
 
     def __init__(self, process: pymem.Pymem):
         self.process = process
-
-        self._symbol_table = {}
 
     # TODO: 2.0 make this a property
     def is_running(self) -> bool:
@@ -55,22 +58,32 @@ class MemoryReader:
         return await loop.run_in_executor(None, function)
 
     def _get_symbols(self, file_path: str, *, force_reload: bool = False):
-        if (dll_table := self._symbol_table.get(file_path)) and not force_reload:
+        # Shared by every reader: a hook is a new reader each time it is activated,
+        # so a per-instance table re-parsed user32.dll on every mouseless activation.
+        key = str(file_path)
+        if not force_reload and (dll_table := _SYMBOL_TABLES.get(key)) is not None:
             return dll_table
 
-        # exe_path = utils.get_wiz_install() / "Bin" / "WizardGraphicalClient.exe"
-        pe = pefile.PE(file_path)
+        # Only the export directory is needed. A full parse of user32.dll takes about
+        # 200 ms of pure Python, holding the GIL; this takes a few.
+        pe = pefile.PE(file_path, fast_load=True)
+        try:
+            pe.parse_data_directories(
+                directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]]
+            )
 
-        symbols = {}
+            symbols = {}
 
-        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-            if exp.name:
-                symbols[exp.name.decode()] = exp.address
+            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                if exp.name:
+                    symbols[exp.name.decode()] = exp.address
 
-            else:
-                symbols[f"Ordinal {exp.ordinal}"] = exp.address
+                else:
+                    symbols[f"Ordinal {exp.ordinal}"] = exp.address
+        finally:
+            pe.close()
 
-        self._symbol_table[file_path] = symbols
+        _SYMBOL_TABLES[key] = symbols
         return symbols
 
     @staticmethod
@@ -226,6 +239,8 @@ class MemoryReader:
         module = pymem.process.module_from_name(
             self.process.process_handle, module_name
         )
+        if module is None:
+            raise ValueError(f"Module {module_name} is not loaded in the process")
 
         return module.lpBaseOfDll + symbol
 

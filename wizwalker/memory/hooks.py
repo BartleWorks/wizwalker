@@ -13,7 +13,7 @@ from wizwalker.constants import kernel32
 
 
 class MemoryHook(MemoryReader):
-    def __init__(self, hook_handler, hook_cache = {}):
+    def __init__(self, hook_handler, hook_cache=None):
         super().__init__(hook_handler.process)
         self.hook_handler = hook_handler
         self._hook_cache = hook_cache
@@ -563,9 +563,11 @@ class User32GetClassInfoBaseHook(AutoBotBaseHook):
         rb"\x48\x89\x5C\x24\x20\x55\x56\x57\x41\x54\x41\x55\x41\x56\x41\x57........"
         rb"\x48......\x48\x8B\x05.+\x48\x33\xC4.+\x48\x8B\xDA\x4C"
     )
-    # rounded down
-    AUTOBOT_SIZE = 1200
-    
+    # How much of GetClassInfoExA the hooks may use. The function's own body is about
+    # 0x2C0 bytes on Windows 11 and whatever follows it is other user32 code (EndDialog
+    # starts 0x450 bytes on), so stay well inside it. The mouseless hook takes 50.
+    AUTOBOT_SIZE = 0x80
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._hooked_instances = 0
@@ -585,12 +587,13 @@ class User32GetClassInfoBaseHook(AutoBotBaseHook):
                 "Somehow used the entirety of the GetClassInfoExA function"
             )
 
+        # Kept so unhook can put back exactly the bytes the hooks wrote over. Nothing
+        # past them is touched: the region used to be zeroed whole, 1200 bytes, which
+        # ran out of GetClassInfoExA and over the user32 code after it.
         if self._autobot_original_bytes is None:
             self._autobot_original_bytes = await self.read_bytes(
                 self._autobot_addr, self.AUTOBOT_SIZE
             )
-            # this is so instructions don't collide
-            await self.write_bytes(self._autobot_addr, b"\x00" * self.AUTOBOT_SIZE)
 
         addr = self._autobot_addr + self._autobot_bytes_offset
         self._autobot_bytes_offset += size
@@ -606,12 +609,15 @@ class User32GetClassInfoBaseHook(AutoBotBaseHook):
         await self.write_bytes(self.jump_address, self.jump_original_bytecode)
 
         if self._hooked_instances == 0:
-            await self.write_bytes(self._autobot_addr, self._autobot_original_bytes)
+            await self.write_bytes(
+                self._autobot_addr,
+                self._autobot_original_bytes[:self._autobot_bytes_offset],
+            )
             self._autobot_bytes_offset = 0
 
 
 class MouselessCursorMoveHook(User32GetClassInfoBaseHook):
-    def __init__(self, memory_handler, hook_cache = {}):
+    def __init__(self, memory_handler, hook_cache=None):
         super().__init__(memory_handler, hook_cache=hook_cache)
         self.mouse_pos_addr = None
 
@@ -725,12 +731,15 @@ class MouselessCursorMoveHook(User32GetClassInfoBaseHook):
         await self.set_mouse_pos_addr()
         packed_mouse_pos_addr = struct.pack("<Q", self.mouse_pos_addr)
 
+        # This replaces GetCursorPos outright, so it returns what GetCursorPos would:
+        # TRUE in eax. rax is a volatile return register, free to use. It used to be
+        # pushed and popped, handing back whatever the caller left in it, which
+        # read as failure whenever that happened to be 0.
         # fmt: off
         bytecode = (
-                b"\x50"  # push rax
                 b"\x48\xA1" + packed_mouse_pos_addr +  # mov rax, mouse_pos
                 b"\x48\x89\x01"  # mov [rcx], rax
-                b"\x58"  # pop rax
+                b"\xB8\x01\x00\x00\x00"  # mov eax, 1
                 b"\xC3"  # ret
         )
         # fmt: on
