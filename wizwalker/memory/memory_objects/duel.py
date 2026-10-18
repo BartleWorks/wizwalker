@@ -1,3 +1,4 @@
+import asyncio
 from typing import List, Optional
 
 from wizwalker.errors import MemoryReadError
@@ -374,13 +375,18 @@ class CurrentDuel(Duel):
         while True: # sometimes this can go wrong thanks to bad timing
             duel_manager = DynamicClientDuelManager(self.hook_handler, await self.read_typed(self._duel_manager_addr, Primitive.int64))
             try:
+                # Read once, not once per participant: every duel in the zone is walked.
+                my_id = await self.hook_handler.client.client_object.global_id_full()
                 for duel in (await duel_manager.duelmap()).values():
                     for part in await duel.participant_list():
-                        if await part.owner_id_full() == await self.hook_handler.client.client_object.global_id_full():
+                        if await part.owner_id_full() == my_id:
                             return await duel.read_base_address()
                 return 0 # we succeeded but aren't in a duel
             except (ValueError, MemoryReadError):
                 pass # if something else happens we want it to fail
+            # A memory read never suspends, so a retry without a sleep would hold the
+            # event loop for as long as the map stays unreadable.
+            await asyncio.sleep(0.05)
 
     async def duel_phase(self) -> DuelPhase:
         try:

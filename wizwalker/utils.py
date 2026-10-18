@@ -403,11 +403,13 @@ async def wait_for_value(
                 return now
 
         except Exception as e:
-            if ignore_errors:
-                await asyncio.sleep(sleep_time)
-
-            else:
+            if not ignore_errors:
                 raise e
+
+        # Sleep after a mismatch too, not only after an error: a memory read never
+        # suspends, so without this the loop holds the event loop until the value
+        # changes, and nothing else runs -- not even a timeout around this call.
+        await asyncio.sleep(sleep_time)
 
 
 async def wait_for_non_error(coro, sleep_time: float = 0.5):
