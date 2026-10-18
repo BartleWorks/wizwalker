@@ -30,14 +30,12 @@ async def async_sorted(iterable, /, *, key=None, reverse=False):
     if key is None:
         return sorted(iterable, reverse=reverse)
 
-    evaluated = {}
-
-    for item in iterable:
-        evaluated[item] = await key(item)
-
-    return [
-        i[0] for i in sorted(evaluated.items(), key=lambda it: it[1], reverse=reverse)
-    ]
+    # Keys by position, not in a dict keyed by item: that dropped equal items and
+    # needed every item to be hashable.
+    items = list(iterable)
+    keys = [await key(item) for item in items]
+    order = sorted(range(len(items)), key=keys.__getitem__, reverse=reverse)
+    return [items[i] for i in order]
 
 
 class Color:
@@ -130,7 +128,9 @@ class Rectangle:
         return str(self)
 
     def __iter__(self):
-        return iter((self.x1, self.x2, self.y1, self.y2))
+        # The order the constructor takes, so Rectangle(*rect) and tuple(rect) agree.
+        # It was (x1, x2, y1, y2), which wrote a window's rectangle back scrambled.
+        return iter((self.x1, self.y1, self.x2, self.y2))
 
     def scale_to_client(self, parents: List["Rectangle"], factor: float) -> "Rectangle":
         """
@@ -352,35 +352,17 @@ def calculate_perfect_yaw(current_xyz: XYZ, target_xyz: XYZ) -> float:
         current_xyz: Starting position xyz
         target_xyz: Ending position xyz
     """
-    target_line = math.dist(
-        (current_xyz.x, current_xyz.y), (target_xyz.x, target_xyz.y)
-    )
-    origin_line = math.dist(
-        (current_xyz.x, current_xyz.y), (current_xyz.x, current_xyz.y - 1)
-    )
-    target_to_origin_line = math.dist(
-        (target_xyz.x, target_xyz.y), (current_xyz.x, current_xyz.y - 1)
-    )
+    dx = target_xyz.x - current_xyz.x
+    dy = target_xyz.y - current_xyz.y
 
-    if 1.0 - abs(origin_line) > 0.0 or 1.0 - abs(target_line) > 0.0:
-        # will lead to division by 0 if left alone
+    # closer than a unit: no meaningful direction
+    if math.hypot(dx, dy) < 1.0:
         return 0
 
-    # target_angle = math.cos(origin_line / target_line)
-    target_angle = math.acos(
-        (pow(target_line, 2) + pow(origin_line, 2) - pow(target_to_origin_line, 2))
-        / (2 * origin_line * target_line)
-    )
-
-    if target_xyz.x > current_xyz.x:
-        # outside
-        target_angle_degres = math.degrees(target_angle)
-        perfect_yaw = math.radians(360 - target_angle_degres)
-    else:
-        # inside
-        perfect_yaw = target_angle
-
-    return perfect_yaw
+    # Yaw 0 faces -y and grows counterclockwise, in [0, 2pi). This was the law of
+    # cosines through acos, whose argument rounds past +-1 for a target due north or
+    # south and raised ValueError for about half of them.
+    return math.atan2(-dx, -dy) % math.tau
 
 
 # TODO: 2.0 rename coro to awaitable (do for other wait_for methods also)
@@ -636,7 +618,7 @@ def get_window_rectangle(handle: int) -> Rectangle:
     user32.GetWindowRect(handle, ctypes.byref(rect))
 
     # noinspection PyTypeChecker
-    return Rectangle(rect.right, rect.top, rect.left, rect.bottom)
+    return Rectangle(rect.left, rect.top, rect.right, rect.bottom)
 
 
 def check_if_process_running(handle: int) -> bool:
@@ -666,7 +648,9 @@ def get_all_wizard_handles() -> list:
     target_class = "Wizard Graphical Client"
 
     def callback(handle):
-        class_name = ctypes.create_unicode_buffer(len(target_class))
+        # GetClassNameW's count includes the terminator, and so must the buffer:
+        # one character short let it write past the end.
+        class_name = ctypes.create_unicode_buffer(len(target_class) + 1)
         user32.GetClassNameW(handle, class_name, len(target_class) + 1)
         if target_class == class_name.value:
             return True
@@ -760,10 +744,12 @@ def pharse_node_data(file_data: bytes) -> dict:
     file_data = file_data[20:]
 
     last_start = 0
-    while file_data:
+    while True:
         start = file_data.find(entry_start, last_start)
         if start == -1:
             break
+        # never moved on, so any file with a node looped forever on the first
+        last_start = start + len(entry_start)
 
         # fmt: off
         entry = file_data[start: start + 48 + 2]
@@ -808,44 +794,28 @@ def pharse_node_data(file_data: bytes) -> dict:
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 def pharse_nav_data(file_data: bytes):
-    file_data = file_data[2:]
+    # Read at an offset: slicing the rest of the file off each record copied it
+    # every time, quadratic in the file's size.
+    pos = 2
 
-    vertex_count_bytes = file_data[:4]
-    file_data = file_data[4:]
-
-    vertex_count = struct.unpack("<i", vertex_count_bytes)[0]
+    vertex_count = struct.unpack_from("<i", file_data, pos)[0]
+    pos += 4
 
     vertices = []
     for idx in range(vertex_count):
-        position_bytes = file_data[:12]
-        file_data = file_data[12:]
-
-        x, y, z = struct.unpack("<fff", position_bytes)
+        x, y, z, vertex_index = struct.unpack_from("<fffh", file_data, pos)
+        pos += 14
         vertices.append(XYZ(x, y, z))
-
-        vertex_index_bytes = file_data[:2]
-        file_data = file_data[2:]
-
-        vertex_index = struct.unpack("<h", vertex_index_bytes)[0]
 
         if vertex_index != idx:
             raise RuntimeError(
                 f"vertex index doesnt match expected: {idx} got: {vertex_index}"
             )
 
-    edge_count_bytes = file_data[:4]
-    file_data = file_data[4:]
+    edge_count = struct.unpack_from("<i", file_data, pos)[0]
+    pos += 4
 
-    edge_count = struct.unpack("<i", edge_count_bytes)[0]
-
-    edges = []
-    for idx in range(edge_count):
-        start_stop_bytes = file_data[:4]
-        file_data = file_data[4:]
-
-        start, stop = struct.unpack("<hh", start_stop_bytes)
-
-        edges.append((start, stop))
+    edges = [struct.unpack_from("<hh", file_data, pos + 4 * idx) for idx in range(edge_count)]
 
     return vertices, edges
 

@@ -113,9 +113,12 @@ class ReadingEnumFailed(WizWalkerMemoryError):
         super().__init__(f"Error reading enum: {value} is not a vaid {enum}.")
 
 
-class HookNotReady(WizWalkerMemoryError):
+class HookNotReady(MemoryReadError):
     """
     Raised when trying to use a value from a hook before hook has run
+
+    A MemoryReadError, since that is what callers saw (and caught) in its place
+    while the handler never raised it.
 
     Attributes:
         hook_name: Name of the hook that is not ready

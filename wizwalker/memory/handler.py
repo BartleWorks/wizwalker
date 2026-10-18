@@ -4,10 +4,9 @@ from typing import Any
 import warnings
 
 import pymem
-import pymem.exception
 from loguru import logger
 
-from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady
+from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady, MemoryReadError
 from .hooks import (
     ChatHook,
     ChatSendHook,
@@ -119,15 +118,31 @@ class HookHandler(MemoryReader):
         return address
 
     async def close(self):
-        for hook in self._active_hooks.values():
-            await hook.unhook()
+        # Every hook is unhooked, and the autobot rewritten, even when one of them
+        # fails: stopping at the first left the rest written into the game. The first
+        # failure is raised once all of it has been tried.
+        first_error = None
+        try:
+            for hook in self._active_hooks.values():
+                try:
+                    await hook.unhook()
+                except Exception as exc:
+                    logger.exception(f"Unhooking {type(hook).__name__} failed")
+                    first_error = first_error or exc
 
-        await self._rewrite_autobot()
+            try:
+                await self._rewrite_autobot()
+            except Exception as exc:
+                logger.exception("Rewriting the autobot function failed")
+                first_error = first_error or exc
+        finally:
+            self._active_hooks = {}
+            self._autobot_pos = 0
+            self._autobot_address = None
+            self._base_addrs = {}
 
-        self._active_hooks = {}
-        self._autobot_pos = 0
-        self._autobot_address = None
-        self._base_addrs = {}
+        if first_error is not None:
+            raise first_error
 
     async def _check_for_autobot(self):
         if self._autobot_lock is None:
@@ -150,7 +165,9 @@ class HookHandler(MemoryReader):
 
         try:
             return await self.read_typed(addr, Primitive.int64)
-        except pymem.exception.MemoryReadError:
+        # read_bytes raises wizwalker's MemoryReadError, never pymem's, which is all
+        # this used to catch
+        except MemoryReadError:
             raise HookNotReady(hook_name)
 
     # wait for an addr to be set and not 0
@@ -162,8 +179,8 @@ class HookHandler(MemoryReader):
                     logger.debug(
                         f"Waiting for address {hex(address)}; got value {value}"
                     )
-                except pymem.exception.MemoryReadError:
-                    pass
+                except MemoryReadError:
+                    await asyncio.sleep(0.5)
                 else:
                     if value != 0:
                         logger.debug(f"Address {hex(address)} is set")
