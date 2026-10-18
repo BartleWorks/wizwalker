@@ -57,6 +57,10 @@ class HookHandler(MemoryReader):
 
         self._hook_cache = {}
 
+        # PropertyClass.read_type_name's answers, by vtable address. Code is static for
+        # the life of the process, so they never go stale.
+        self.type_name_cache: dict[int, str] = {}
+
     async def _get_open_autobot_address(self, size: int) -> int:
         if self._autobot_pos + size > self.AUTOBOT_SIZE:
             raise RuntimeError("Somehow went over autobot size")

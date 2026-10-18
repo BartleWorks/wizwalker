@@ -5,8 +5,6 @@ from contextlib import suppress
 from loguru import logger
 
 from wizwalker.memory.memory_object import (
-    MAX_STRING,
-    WIDE_BUF_CHARS,
     Primitive,
     DynamicMemoryObject,
     PropertyClass,
@@ -178,24 +176,14 @@ class Window(PropertyClass):
             offset = 712
 
         base_address = await self.read_base_address() + offset
-        string_len = await self.read_typed(base_address + 16, Primitive.int32)
-        # Bounded as read_string is; see read_wide_string.
-        if not 1 <= string_len <= MAX_STRING:
-            return ""
 
         # NOT always a pointer: while the string's capacity still fits MSVC's inline
         # buffer, these 16 bytes hold the characters themselves. Reading them as an
         # address raised MemoryReadError on any control that had only ever shown a short
         # string -- a castle row reading "Ferme" faulted at 0x006D007200650046, which is
         # those letters. See MemoryObject._string_data_address for the layout, and for
-        # why the test is capacity rather than length.
-        string_address = await self._string_data_address(base_address, WIDE_BUF_CHARS)
-
-        # wide chars take 2 bytes
-        try:
-            return (await self.read_bytes(string_address, string_len * 2)).decode("utf-16")
-        except UnicodeDecodeError:
-            return ""
+        # why the test is capacity rather than length. read_wide_string decides by it.
+        return await self.read_wide_string(base_address)
 
     async def write_maybe_text(self, text: str):
         """

@@ -92,17 +92,35 @@ class MemoryObject(MemoryReader):
         return string_bytes.decode(encoding)
 
     async def read_wide_string(self, address: int, encoding: str = "utf-16") -> str:
-        string_len = await self.read_typed(address + 16, Primitive.int32)
-        # Bounded as read_string is: a stale or wrong address can hold any length,
-        # and pymem allocates a buffer of whatever size it is asked for.
+        # wide chars take 2 bytes
+        return await self._read_basic_string(address, 2, WIDE_BUF_CHARS, encoding)
+
+    async def _read_basic_string(
+        self, address: int, char_size: int, buf_chars: int, encoding: str
+    ) -> str:
+        """Read the MSVC std::basic_string at `address`, laid out as _string_data_address
+        describes, in one read when it is inline and two when it is not.
+
+        The length is bounded: a stale or wrong address can hold any length, and pymem
+        allocates a buffer of whatever size it is asked for.
+        """
+        header = await self.read_bytes(address, 32)
+        string_len = struct.unpack_from("<i", header, 16)[0]
         if not 1 <= string_len <= MAX_STRING:
             return ""
 
-        string_address = await self._string_data_address(address, WIDE_BUF_CHARS)
+        byte_len = string_len * char_size
+        capacity = struct.unpack_from("<Q", header, 24)[0]
+        if capacity >= buf_chars:
+            data = await self.read_bytes(struct.unpack_from("<q", header, 0)[0], byte_len)
+        elif byte_len < 16:
+            data = header[:byte_len]
+        else:
+            # inline, yet longer than the buffer it would live in: not a string
+            return ""
 
-        # wide chars take 2 bytes
         try:
-            return (await self.read_bytes(string_address, string_len * 2)).decode(encoding)
+            return data.decode(encoding)
         except UnicodeDecodeError:
             return ""
 
@@ -191,17 +209,7 @@ class MemoryObject(MemoryReader):
         await self.write_wide_string(base_address + offset, string, encoding)
 
     async def read_string(self, address: int, encoding: str = "utf-8") -> str:
-        string_len = await self.read_typed(address + 16, Primitive.int32)
-
-        if not 1 <= string_len <= MAX_STRING:
-            return ""
-
-        string_address = await self._string_data_address(address, NARROW_BUF_CHARS)
-
-        try:
-            return (await self.read_bytes(string_address, string_len)).decode(encoding)
-        except UnicodeDecodeError:
-            return ""
+        return await self._read_basic_string(address, 1, NARROW_BUF_CHARS, encoding)
 
     async def read_string_from_offset(
         self, offset: int, encoding: str = "utf-8"
@@ -273,11 +281,16 @@ class MemoryObject(MemoryReader):
     async def write_enum(self, offset, value: Enum):
         await self.write_value_to_offset(offset, value.value, Primitive.int32)
 
+    async def _read_vector_bounds(self, offset: int, *, unsigned: bool = False) -> tuple[int, int]:
+        """A std::vector's begin and end pointers, in one read."""
+        base_address = await self.read_base_address()
+        data = await self.read_bytes(base_address + offset, 16)
+        return struct.unpack("<QQ" if unsigned else "<qq", data)
+
     async def read_shared_vector(
         self, offset: int, *, max_size: int = 1000
     ) -> List[int]:
-        start_address = await self.read_value_from_offset(offset, Primitive.int64)
-        end_address = await self.read_value_from_offset(offset + 8, Primitive.int64)
+        start_address, end_address = await self._read_vector_bounds(offset)
         size = end_address - start_address
 
         element_number = size // 16
@@ -297,20 +310,13 @@ class MemoryObject(MemoryReader):
         except (ValueError, AddressOutOfRange, MemoryError):
             return []
 
-        pointers = []
-        data_pos = 0
-        # Shared pointers are 16 in length
-        for _ in range(element_number):
-            # fmt: off
-            shared_pointer_data = shared_pointers_data[data_pos: data_pos + 16]
-            # fmt: on
-
-            # first 8 bytes are the address
-            pointers.append(struct.unpack("<q", shared_pointer_data[:8])[0])
-
-            data_pos += 16
-
-        return pointers
+        # Shared pointers are 16 in length; the first 8 bytes are the address
+        return [
+            address
+            for address, _control_block in struct.iter_unpack(
+                "<qq", shared_pointers_data[: element_number * 16]
+            )
+        ]
 
     async def read_dynamic_vector(
         self, offset: int, data_type: Primitive = Primitive.int64, *, max_size: int = 10_000
@@ -318,8 +324,7 @@ class MemoryObject(MemoryReader):
         """
         Read a vector that changes in size
         """
-        start_address = await self.read_value_from_offset(offset, Primitive.int64)
-        end_address = await self.read_value_from_offset(offset + 8, Primitive.int64)
+        start_address, end_address = await self._read_vector_bounds(offset)
 
         type_str = data_type.value.format.replace("<", "")
         size_per_type = struct.calcsize(type_str)
@@ -332,14 +337,9 @@ class MemoryObject(MemoryReader):
         if size > max_size:
             raise ValueError(f"Size was {size} and the max was {max_size}")
 
-        current_address = start_address
-        pointers = []
-        for _ in range(size):
-            pointers.append(await self.read_typed(current_address, data_type))
-
-            current_address += size_per_type
-
-        return pointers
+        # One read for the lot, not one per element
+        data = await self.read_bytes(start_address, size * size_per_type)
+        return list(struct.unpack(f"<{size}{type_str}", data))
 
     async def read_inlined_vector(
             self,
@@ -349,8 +349,7 @@ class MemoryObject(MemoryReader):
             *,
             max_size: int = 10_000,
     ):
-        start = await self.read_value_from_offset(offset, Primitive.uint64)
-        end = await self.read_value_from_offset(offset + 8, Primitive.uint64)
+        start, end = await self._read_vector_bounds(offset, unsigned=True)
 
         total_size = (end - start) // object_size
 
@@ -403,18 +402,21 @@ class MemoryObject(MemoryReader):
         return addrs
 
     async def _get_std_map_children(self, node, mapped_type, mapped_return):
+        # The node in one read: left +0x0, parent +0x8, right +0x10, color +0x18,
+        # is-nil +0x19, then the value, key at +0x20 and mapped at +0x28.
         # some keys may be smaller but the entire 8 bytes seemed to always be reserved
-        is_leaf = await self.read_typed(node + 0x19, Primitive.bool)
+        data = await self.read_bytes(node, 0x30)
+        is_leaf = data[0x19] != 0
         if not is_leaf:
-            key = await self.read_typed(node + 0x20, Primitive.uint64)
-            mapped_data = await self.read_typed(node + 0x28, Primitive.uint64)
+            left_node, _parent, right_node = struct.unpack_from("<QQQ", data, 0)
+            key, mapped_data = struct.unpack_from("<QQ", data, 0x20)
 
             mapped_return[key] = mapped_type(self.hook_handler, mapped_data)
 
-            if left_node := await self.read_typed(node, Primitive.uint64):
+            if left_node:
                 await self._get_std_map_children(left_node, mapped_type, mapped_return)
 
-            if right_node := await self.read_typed(node + 0x10, Primitive.uint64):
+            if right_node:
                 await self._get_std_map_children(right_node, mapped_type, mapped_return)
 
     # TODO: 2.0 replace this with complex memory read type
@@ -488,6 +490,18 @@ class PropertyClass(MemoryObject):
 
     async def read_type_name(self) -> str:
         vtable = await self.read_value_from_offset(0, Primitive.int64)
+
+        # The name is found from the vtable alone, through code that never changes
+        # while the process runs, so one read of it is enough once its name is known.
+        # Searches by type name ask this of every window in the UI.
+        cache = getattr(self.hook_handler, "type_name_cache", None)
+        if not isinstance(cache, dict):
+            return await self._read_type_name_from_vtable(vtable)
+        if (name := cache.get(vtable)) is None:
+            name = cache[vtable] = await self._read_type_name_from_vtable(vtable)
+        return name
+
+    async def _read_type_name_from_vtable(self, vtable: int) -> str:
         # first function
         get_class_name = await self.read_typed(vtable, Primitive.int64)
         # sometimes is a function with a jmp, sometimes just a body pointer
