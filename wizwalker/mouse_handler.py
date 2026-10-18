@@ -156,10 +156,13 @@ class MouseHandler:
             await asyncio.sleep(self.click_predelay)
             # mouse button down
             send_method(self.client.window_handle, button_down_message, 1, 0)
-            if sleep_duration > 0:
-                await asyncio.sleep(sleep_duration)
-            # mouse button up
-            send_method(self.client.window_handle, button_down_message + 1, 0, 0)
+            try:
+                if sleep_duration > 0:
+                    await asyncio.sleep(sleep_duration)
+            finally:
+                # mouse button up, even when cancelled while held: the game would
+                # otherwise go on believing the button is down
+                send_method(self.client.window_handle, button_down_message + 1, 0, 0)
             # move mouse outside of client area
             await self.set_mouse_position(-100, -100)
 

@@ -60,9 +60,7 @@ class CombatCard:
                 target._spell_window
             )
 
-            # wait until card number goes down
-            while len(await self.combat_handler.get_cards()) > cards_len_before:
-                await asyncio.sleep(0.1)
+            await self._wait_for_hand_below(cards_len_before, sleep_time)
 
             # wiz can't keep up with how fast we can cast
             if sleep_time is not None:
@@ -122,12 +120,26 @@ class CombatCard:
             self._spell_window, right_click=True
         )
 
-        # wait until card number goes down
-        while len(await self.combat_handler.get_cards()) > cards_len_before:
-            await asyncio.sleep(0.1)
+        await self._wait_for_hand_below(cards_len_before, sleep_time)
 
         if sleep_time is not None:
             await asyncio.sleep(sleep_time)
+
+    async def _wait_for_hand_below(self, count: int, timeout: Optional[float]):
+        """Wait until the hand holds fewer than `count` cards, for up to `timeout` seconds.
+
+        This tested `> count`, already false the moment the click landed, so it never
+        waited. It is bounded because the game drops a click now and then, and a
+        caller that retries one (SprintyCombat's fuse) must get control back.
+        """
+        if not timeout:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while len(await self.combat_handler.get_cards()) >= count:
+            if loop.time() >= deadline:
+                return
+            await asyncio.sleep(0.1)
 
     # TODO: 2.0 rename get_* effects to just attr name i.e async def graphical_spell
     async def get_graphical_spell(

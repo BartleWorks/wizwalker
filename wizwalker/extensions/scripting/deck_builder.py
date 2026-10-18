@@ -551,13 +551,14 @@ class DeckBuilder:
                 pass
         return list_of_deck_spell_graphicals
 
-    async def clear_item_deck(self) -> None:
+    async def clear_item_deck(self, *, attempts: int = 5) -> None:
         await self.view_deck_cards()
-        while True:
+        # Bounded: a slot whose click never registers used to keep this going forever.
+        for _ in range(attempts):
             slots = await self._scan_all_item_pages()
             active = [s for s in slots if s.is_active]
             if not active:
-                break
+                return
             for page in sorted({s.page for s in active}):
                 await self._go_to_item_page(page)
                 rect = await self.get_item_spells_rectangle()
@@ -567,8 +568,9 @@ class DeckBuilder:
                         if slot.page == page:
                             await self.client.mouse_handler.click(*divided[slot.slot_index].center())
                             await asyncio.sleep(0.1)
+        raise RuntimeError(f"Item cards still active after {attempts} passes")
 
-    async def clear_deck(self) -> None:
+    async def clear_deck(self, *, attempts: int = 3) -> None:
         await self.view_deck_cards()
         try:
             clear_deck_button = await _maybe_get_named_window(self._deck_config_window, "ClearDeckButton")
@@ -585,7 +587,10 @@ class DeckBuilder:
                 return
             await self.clear_deck_manual()
             # We run it again because it might be clicking to fast. It's fast enough that I dont care to run it again
-            await self.clear_deck()
+            # Bounded: a deck that never clears used to recurse until the stack ran out.
+            if attempts <= 1:
+                raise RuntimeError(f"Deck still holds {number_of_cards} card(s) after clearing it")
+            await self.clear_deck(attempts=attempts - 1)
 
     async def clear_deck_manual(self) -> None:
         number_of_cards = await self.get_deck_count()
@@ -768,12 +773,14 @@ class DeckBuilder:
         async with self.client.mouse_handler:
             await self.client.mouse_handler.click_window(quit_button)
 
+        # The sleeps matter: a window lookup never suspends, so without them these
+        # loops held the event loop for the whole logout.
         while True:
             try:
                 play_button = await _maybe_get_named_window(self.client.root_window, "btnPlay")
                 break
             except ValueError:
-                pass
+                await asyncio.sleep(0.25)
         async with self.client.mouse_handler:
             await self.client.mouse_handler.click_window(play_button)
         while True:
@@ -781,7 +788,7 @@ class DeckBuilder:
                 await _maybe_get_named_window(self.client.root_window, "btnSpellbook")
                 break
             except ValueError:
-                pass
+                await asyncio.sleep(0.25)
         print('User has logged out and logged back in')
 
     async def add_item_cards(self, section: dict) -> None:

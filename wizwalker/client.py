@@ -402,12 +402,13 @@ class Client:
         """
         This client's backpack space used and max
         """
+        exclusion_set = {make_string_id(x) for x in ["NotCounted", "Jewel", "Emote"]}
+
         async def should_count_item(obj: CoreObject) -> bool:
             template = await obj.object_template()
             template = WizGameObjectTemplate(self.hook_handler, await template.read_base_address())
             if await template.object_type() in [ObjectType.deed, ObjectType.structure]:
                 return False
-            exclusion_set = set([make_string_id(x) for x in ["NotCounted", "Jewel", "Emote"]])
             propset = await template.object_property_hashset()
             if len(exclusion_set.intersection(propset)) > 0:
                 return False
@@ -416,10 +417,12 @@ class Client:
         item_count = 0
 
         inventory_behavior = await self.client_object.try_get_inventory_behavior()
-        if inventory_behavior:
-            for item in await inventory_behavior.item_list():
-                if await should_count_item(item):
-                    item_count += 1
+        # The capacity comes from it, so without one there is no answer to give.
+        if not inventory_behavior:
+            raise ValueError("Client has no inventory behavior; probably not in game yet")
+        for item in await inventory_behavior.item_list():
+            if await should_count_item(item):
+                item_count += 1
 
         equipment_behavior = await self.client_object.try_get_equipment_behavior()
         if equipment_behavior:
