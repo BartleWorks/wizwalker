@@ -411,6 +411,53 @@ async def wait_for_non_error(coro, sleep_time: float = 0.5):
             await asyncio.sleep(sleep_time)
 
 
+async def poll_until(
+    predicate: Callable,
+    *,
+    timeout: float,
+    interval: float = 0.05,
+    ignore_errors: bool = True,
+) -> bool:
+    """
+    Poll an awaitable predicate until it holds, for up to timeout seconds
+
+    For the waits that stand in for something the game shows: pass the old fixed
+    wait as the timeout, and the caller is never slower than it was, only faster
+    when the change shows sooner. The predicate is read at least once, and once
+    more at the deadline.
+
+    Args:
+        predicate: Awaitable returning a truthy value once the wait is over
+        timeout: Seconds to give up after
+        interval: Seconds between reads
+        ignore_errors: If an exception from the predicate counts as not yet
+
+    Returns:
+        True if the predicate held, False if the deadline passed first
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    while True:
+        try:
+            if await predicate():
+                return True
+        except Exception:
+            if not ignore_errors:
+                raise
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+
+        await asyncio.sleep(min(interval, remaining))
+
+
+def _coro_name(coro) -> str:
+    # A functools.partial has no __name__, and the timeout error read it
+    return getattr(coro, "__name__", None) or repr(coro)
+
+
 async def maybe_wait_for_value_with_timeout(
     coro,
     sleep_time: float = 0.5,
@@ -437,10 +484,14 @@ async def maybe_wait_for_value_with_timeout(
                 elif value is None and inverse_value and res is not None:
                     return res
 
+                # waiting for None itself; this case never returned
+                elif value is None and not inverse_value and res is None:
+                    return res
+
             except Exception as e:
                 if ignore_exceptions:
+                    # the sleep below covers it; sleeping here too doubled the interval
                     possible_exception = e
-                    await asyncio.sleep(sleep_time)
 
                 else:
                     raise e
@@ -451,7 +502,7 @@ async def maybe_wait_for_value_with_timeout(
         return await asyncio.wait_for(_inner(), timeout)
     except asyncio.TimeoutError:
         raise ExceptionalTimeout(
-            f"Timed out waiting for coro {coro.__name__}", possible_exception
+            f"Timed out waiting for coro {_coro_name(coro)}", possible_exception
         )
 
 
@@ -477,7 +528,6 @@ async def maybe_wait_for_any_value_with_timeout(
                 if ignore_exceptions:
                     possible_exception = e
 
-
                 else:
                     raise e
 
@@ -487,7 +537,7 @@ async def maybe_wait_for_any_value_with_timeout(
         return await asyncio.wait_for(_inner(), timeout)
     except asyncio.TimeoutError:
         raise ExceptionalTimeout(
-            f"Timed out waiting for coro", possible_exception
+            f"Timed out waiting for coro {_coro_name(coro)}", possible_exception
         )
 
 
