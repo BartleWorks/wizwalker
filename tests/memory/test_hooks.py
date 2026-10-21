@@ -2,6 +2,7 @@ import struct
 from types import SimpleNamespace
 
 import pytest
+import regex
 
 from wizwalker.memory import hooks
 from wizwalker.memory.handler import HookHandler
@@ -94,6 +95,28 @@ async def test_the_autobot_refuses_more_than_it_holds(autobot):
     autobot._autobot_pos = HookHandler.AUTOBOT_SIZE - 10
     with pytest.raises(RuntimeError):
         await autobot._allocate_autobot_bytes(50)
+
+
+# --- the client hook's site ----------------------------------------------------
+
+
+def _client_site(slot: int) -> bytes:
+    """ClientHook's site with made-up operands: the instruction forms are the client's."""
+    return bytes.fromhex(
+        "48 8b 18"  # mov rbx, [rax]
+        "48 8b 9b 00 02 00 00"  # mov rbx, [rbx+0x200]: the instruction the hook moves
+        f"48 8b 7c 24 {slot:02x}"  # mov rdi, [rsp+slot]
+        "48 85 ff 74 29 8b c6 f0 0f c1 47 08 83 f8 01 75 1d"  # test; je; lock xadd [rdi+8]
+        "48 8b 07 48 8b cf ff 50 08 f0 0f c1 77 0c"  # the release call; lock xadd [rdi+0xC]
+    )
+
+
+@pytest.mark.parametrize("slot", [0x38, 0x40], ids=["r806919", "r811339"])
+def test_the_client_hook_finds_its_site_wherever_the_stack_slot_is(slot):
+    page = b"\xcc" * 16 + _client_site(slot) + b"\xcc" * 16
+    matches = [m.start() for m in regex.finditer(hooks.ClientHook.pattern, page, regex.DOTALL)]
+    # get_jump_address adds the one byte the pattern starts early
+    assert [m + 1 for m in matches] == [16 + 3]
 
 
 # --- movement teleport ---------------------------------------------------------
