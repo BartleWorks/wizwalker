@@ -141,11 +141,43 @@ async def _click_on_friend(client, friends_list, friend_index):
     await asyncio.sleep(1)
 
 
+async def _message_box_caption(client):
+    """The caption of the modal message box, or None while none is up.
+
+    The window tree keeps the box's windows around after it closes, so the window existing
+    says nothing; its caption only holds text while a dialog is showing.
+    """
+    boxes = await client.root_window.get_windows_with_name("MessageBoxModalWindow")
+    if len(boxes) != 1:
+        return None
+
+    captions = await boxes[0].get_windows_with_name("CaptionText")
+    if len(captions) != 1:
+        return None
+
+    return await captions[0].maybe_text()
+
+
+async def _wait_for_message_box(client, timeout: float = 3.0, interval: float = 0.05):
+    """Wait for a modal message box to appear, returning as soon as it does.
+
+    Gives up quietly after *timeout*, leaving the caller's own lookup to report a box
+    that never came.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    while loop.time() < deadline:
+        if await _message_box_caption(client):
+            return
+
+        await asyncio.sleep(interval)
+
+
 async def _teleport_to_friend(client, character_window):
     teleport_button = await _maybe_get_named_window(character_window, "btnGoToFriend")
     await client.mouse_handler.click_window(teleport_button)
-    # wait for confirmation window
-    await asyncio.sleep(1)
+    await _wait_for_message_box(client)
 
     confirmation_window = await _maybe_get_named_window(
         client.root_window, "MessageBoxModalWindow"
