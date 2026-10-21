@@ -78,16 +78,17 @@ class MemoryHook(MemoryReader):
         """
         Gets the bytecode to write to the jump address
         """
-        raise NotImplemented()
+        # NotImplemented is a value, not an exception: raising it was a TypeError
+        raise NotImplementedError()
 
     async def get_hook_bytecode(self) -> bytes:
         """
         Gets the bytecord to write to the hook address
         """
-        raise NotImplemented()
+        raise NotImplementedError()
 
     async def get_pattern(self) -> Tuple[bytes, str]:
-        raise NotImplemented()
+        raise NotImplementedError()
 
     async def hook(self):
         """
@@ -175,7 +176,7 @@ class SimpleHook(AutoBotBaseHook):
         return b"\xE9" + packed_relitive_jump + (b"\x90" * self.noops)
 
     async def bytecode_generator(self, packed_exports):
-        raise NotImplemented()
+        raise NotImplementedError()
 
     async def get_hook_bytecode(self) -> bytes:
         packed_exports = []
@@ -412,14 +413,13 @@ class MovementTeleportHook(SimpleHook):
         self._old_je_page_protection = self._set_page_protection(target_address, 0x40)
 
     async def bytecode_generator(self, packed_exports):
-        packed_should_update = bytearray(packed_exports[0][1])
-        packed_should_update[0] += 12
-
-        packed_z = bytearray(packed_exports[0][1])
-        packed_z[0] += 8
-
-        packed_target_addr = bytearray(packed_exports[0][1])
-        packed_target_addr[0] += 13
+        # The helper's fields, offset from the whole address. Adding to its low byte
+        # alone dropped the carry, and raised past 0xFF; that held only because
+        # allocations come 64 KB aligned.
+        helper = struct.unpack("<Q", packed_exports[0][1])[0]
+        packed_should_update = struct.pack("<Q", helper + 12)
+        packed_z = struct.pack("<Q", helper + 8)
+        packed_target_addr = struct.pack("<Q", helper + 13)
 
         jes = await self.hook_handler.client._get_je_instruction_forward_backwards()
 
