@@ -93,12 +93,15 @@ class _GlobalHotkeyMessageLoop:
         self.connected_instances += 1
 
     def disconnect(self):
-        self.connected_instances -= 1
+        self.connected_instances = max(self.connected_instances - 1, 0)
 
         if self.connected_instances == 0:
             if self.message_loop_task:
                 with suppress(asyncio.CancelledError):
                     self.message_loop_task.cancel()
+                # Forgotten, so the next connect starts a loop again: connect only
+                # starts one when there is none, and a cancelled task still counted.
+                self.message_loop_task = None
 
     def set_message_loop_delay(self, new_delay: float):
         self._message_loop_delay = new_delay
@@ -337,7 +340,9 @@ class HotkeyListener:
         """
         Stop the listener
         """
-        _hotkey_message_loop.disconnect()
+        # Once per start: a second stop took the global loop's count below zero
+        if self._message_loop_task:
+            _hotkey_message_loop.disconnect()
 
         for hotkey_id in self._hotkeys.values():
             res = user32.UnregisterHotKey(None, hotkey_id)
@@ -391,6 +396,9 @@ class HotkeyListener:
             )
 
         del self._hotkeys[(key.value, modifiers)]
+        # Kept under the key add_hotkey stored it by; left behind, the loop kept
+        # polling for it and a later add of the same key reused the old callback
+        self._callbacks.pop((key.value, modifiers & ~ModifierKeys.NOREPEAT), None)
 
     @staticmethod
     async def set_global_message_loop_delay(delay: float):
@@ -425,9 +433,15 @@ class HotkeyListener:
             await asyncio.sleep(self.sleep_time)
 
     async def _handle_hotkey(self, keycode: int, modifiers: int):
-        self._callback_tasks.append(
-            asyncio.create_task(self._callbacks[(keycode, modifiers)]())
-        )
+        task = asyncio.create_task(self._callbacks[(keycode, modifiers)]())
+        self._callback_tasks.append(task)
+        # Dropped once done, so stop() cancels what is running and the list doesn't
+        # grow by one for every press
+        task.add_done_callback(self._forget_callback_task)
+
+    def _forget_callback_task(self, task: asyncio.Task):
+        with suppress(ValueError):
+            self._callback_tasks.remove(task)
 
     async def _register_hotkey(self, keycode: int, modifiers: int = 0) -> bool:
         hotkey_id = await _hotkey_id_manager.get_id()
