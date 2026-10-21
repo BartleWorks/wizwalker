@@ -51,6 +51,44 @@ class FakeProcess:
         values = struct.unpack("<" + fmt, self.read_bytes(address, struct.calcsize("<" + fmt)))
         return values[0] if len(values) == 1 else values
 
+    # --- game containers, laid out as MSVC lays them out ---------------------
+
+    def std_map(self, at: int, entries: dict[int, int]) -> int:
+        """Put a std::map<u64, u64> whose head pointer is at `at`; returns the head.
+
+        The head's parent is the tree's root, and every missing child points back at
+        the head, whose is-nil byte is set. The nodes chain down their right links.
+        """
+        head = self.allocate(0x30)
+        self.put(head + 0x19, "B", 1)
+        self.put(at, "Q", head)
+
+        nodes = [self.allocate(0x30) for _ in entries]
+        for index, (node, (key, mapped)) in enumerate(zip(nodes, entries.items())):
+            right = nodes[index + 1] if index + 1 < len(nodes) else head
+            parent = nodes[index - 1] if index else head
+            self.put(node, "QQQBB", head, parent, right, 0, 0)
+            self.put(node + 0x20, "QQ", key, mapped)
+
+        root = nodes[0] if nodes else head
+        self.put(head, "QQQ", head, root, head)
+        return head
+
+    def shared_vector(self, at: int, pointers: list[int]):
+        """Put a std::vector<shared_ptr<T>> at `at`: begin and end, 16 bytes an element."""
+        data = b"".join(struct.pack("<qq", p, 0) for p in pointers)
+        begin = self.allocate(max(len(data), 1))
+        self.write_bytes(begin, data, len(data))
+        self.put(at, "qq", begin, begin + len(data))
+
+    def vector(self, at: int, fmt: str, values: list) -> int:
+        """Put a std::vector of `fmt` values at `at`; returns where the elements are."""
+        data = struct.pack("<" + fmt * len(values), *values)
+        begin = self.allocate(max(len(data), 1))
+        self.write_bytes(begin, data, len(data))
+        self.put(at, "qq", begin, begin + len(data))
+        return begin
+
     def _locate(self, address: int, size: int) -> tuple[bytearray, int]:
         for base, region in self._regions.items():
             if base <= address and address + size <= base + len(region):

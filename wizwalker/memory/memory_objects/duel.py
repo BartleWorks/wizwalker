@@ -10,6 +10,13 @@ from .enums import DuelExecutionOrder, DuelPhase, SigilInitiativeSwitchMode
 from .combat_resolver import DynamicCombatResolver
 
 
+#: How long CurrentDuel keeps retrying a duel map it can't read. A read mid-change
+#: clears in a frame or two, but before the client hook has run, or at character
+#: select, the map never reads, and an unbounded retry kept in_battle() from
+#: ever returning.
+DUEL_LOOKUP_TIMEOUT = 2.0
+
+
 # TODO: add m_gameEffectInfo and friends, and fix offsets
 class Duel(PropertyClass):
     async def read_base_address(self) -> int:
@@ -372,6 +379,8 @@ class CurrentDuel(Duel):
             self._duel_manager_addr = mov_instruction_addr + 7 + rip_offset
         # avoid circular import
         from .client_duel_manager import DynamicClientDuelManager
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + DUEL_LOOKUP_TIMEOUT
         while True: # sometimes this can go wrong thanks to bad timing
             duel_manager = DynamicClientDuelManager(self.hook_handler, await self.read_typed(self._duel_manager_addr, Primitive.int64))
             try:
@@ -384,6 +393,9 @@ class CurrentDuel(Duel):
                 return 0 # we succeeded but aren't in a duel
             except (ValueError, MemoryReadError):
                 pass # if something else happens we want it to fail
+            if loop.time() >= deadline:
+                # duel_phase reads this as ended, so in_battle() answers False
+                raise MemoryReadError("Couldn't read the duel map; probably not in game yet")
             # A memory read never suspends, so a retry without a sleep would hold the
             # event loop for as long as the map stays unreadable.
             await asyncio.sleep(0.05)
