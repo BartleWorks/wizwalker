@@ -11,6 +11,14 @@ from wizwalker.utils import get_wiz_install
 
 
 class WadFileInfo:
+    """
+    One file's entry in a KIWAD journal
+
+    size is the file's own size; compressed_size is how many bytes it takes in
+    the archive when is_zip is set. unzipped_size is the old, misleading name for
+    compressed_size, kept for callers that read it.
+    """
+
     def __init__(self, *, name, offset, size, is_zip, crc, unzipped_size):
         self.name = name
         self.offset = offset
@@ -18,6 +26,15 @@ class WadFileInfo:
         self.is_zip = is_zip
         self.crc = crc
         self.unzipped_size = unzipped_size
+
+    @property
+    def compressed_size(self) -> int:
+        return self.unzipped_size
+
+    @property
+    def stored_size(self) -> int:
+        """How many bytes the file takes in the archive."""
+        return self.compressed_size if self.is_zip else self.size
 
 
 class Wad:
@@ -129,6 +146,7 @@ class Wad:
                     size=size,
                     is_zip=is_zip,
                     crc=crc,
+                    # the compressed size, despite the keyword's name
                     unzipped_size=zsize,
                 )
             )
@@ -153,7 +171,11 @@ class Wad:
 
         async with aiofiles.open(self.file_path, "rb") as fp:
             await fp.seek(target_file.offset)
-            raw_data = await fp.read(target_file.size)
+            # A compressed file takes its compressed size. Reading its own size worked
+            # only while that was the larger, as zlib ignores what trails the stream;
+            # where compression grew the file, the read was cut short and the raw
+            # bytes came back as the file. Root.wad holds 124 of those.
+            raw_data = await fp.read(target_file.stored_size)
 
             if target_file.is_zip:
                 try:
@@ -202,6 +224,10 @@ class Wad:
         if not path.is_dir():
             raise ValueError(f"{path} is not a directory.")
 
+        # The file list is read on open; a fresh Wad unarchived nothing
+        if not self._open:
+            await self.open()
+
         for file in self._file_list:
             dirs = file.name.split("/")
             # not a base level file
@@ -234,4 +260,4 @@ class Wad:
         if not path.is_dir():
             raise ValueError(f"{path} is not a directory.")
 
-        raise NotImplemented()
+        raise NotImplementedError()
