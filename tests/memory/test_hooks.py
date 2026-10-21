@@ -124,6 +124,35 @@ async def test_the_drops_hook_replays_what_its_jump_overwrites(process, hook_han
     assert code.index(b"\x48\x31\xc0\xc3") < len(code) - 13
 
 
+# --- the root window -----------------------------------------------------------
+
+
+def _root_window_site(load: str) -> bytes:
+    """The root window's load and the vtable call after it, with made-up operands."""
+    return bytes.fromhex(load + "48 8b 01" + "49 8b 97 00 01 00 00" + "ff 50 70 84 db")
+
+
+@pytest.mark.parametrize("load", ["49 8b 8d 00 02 00 00", "49 8b 8f 00 02 00 00"], ids=["r13", "r15"])
+def test_the_root_window_hook_takes_the_load_into_rcx_from_any_register(load):
+    page = b"\xcc" * 16 + _root_window_site(load)
+    assert [m.start() for m in regex.finditer(hooks.RootWindowHook.pattern, page, regex.DOTALL)] == [16]
+
+
+def test_the_root_window_hook_refuses_a_load_that_is_not_seven_bytes():
+    # ModRM 0x8C takes a SIB byte: [r12+disp32] is eight bytes, not the seven replayed
+    page = b"\xcc" * 16 + _root_window_site("49 8b 8c 24 00 02 00 00")
+    assert not regex.search(hooks.RootWindowHook.pattern, page, regex.DOTALL)
+
+
+async def test_the_root_window_hook_exports_rcx_after_replaying_the_load(process, hook_handler):
+    load = bytes.fromhex("49 8b 8f 00 02 00 00")
+    hook = hooks.RootWindowHook(hook_handler)
+    hook.jump_address = process.map(0x8000, _root_window_site(load.hex(" ")))
+    code = await hook.bytecode_generator([("current_root_window_addr", struct.pack("<Q", 0x1234))])
+    assert code.startswith(load)
+    assert code[len(load) :].startswith(b"\x50\x48\x89\xc8\x48\xa3" + struct.pack("<Q", 0x1234))
+
+
 # --- the client hook's site ----------------------------------------------------
 
 

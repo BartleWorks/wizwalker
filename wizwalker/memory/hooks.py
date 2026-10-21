@@ -304,19 +304,25 @@ class ClientHook(SimpleHook):
 
 
 class RootWindowHook(SimpleHook):
-    pattern = rb".......\x48\x8B\x01.......\xFF\x50\x70\x84"
+    # The site loads the root window into rcx, `mov rcx, [reg+disp32]`, ahead of a call
+    # through its vtable. The register holding the object it is read from is r13 on
+    # r806919 and r15 on r811339, so the pattern only asks that the load be into rcx
+    # (ModRM 0x88-0x8F, but not 0x8C, which takes a SIB byte), and the hook replays the
+    # instruction as read from the site and then exports rcx, naming no register.
+    pattern = rb"[\x48\x49]\x8B[\x88-\x8B\x8D-\x8F]....\x48\x8B\x01.......\xFF\x50\x70\x84"
     instruction_length = 7
     noops = 2
     exports = [("current_root_window_addr", 8)]
 
     async def bytecode_generator(self, packed_exports):
+        original = await self.hook_handler.read_bytes(self.jump_address, self.instruction_length)
         # fmt: off
         bytecode = (
+            original +  # mov rcx, [reg+disp32]: the root window
             b"\x50"  # push rax
-            b"\x49\x8B\x85\xD8\x00\x00\x00"  # mov rax,[r13+D8]
+            b"\x48\x89\xC8"  # mov rax, rcx
             b"\x48\xA3" + packed_exports[0][1] +  # mov [current_root_window_addr], rax
             b"\x58"  # pop rax
-            b"\x49\x8B\x8D\xD8\x00\x00\x00"  # original instruction
         )
         # fmt: on
 
