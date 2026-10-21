@@ -2,9 +2,12 @@ import math
 import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
-from wizwalker.extensions.scripting.utils import _maybe_get_named_window
+
+from loguru import logger
+
+from wizwalker.extensions.scripting.utils import _maybe_get_named_window, _wait_for_message_box
 from wizwalker.memory.memory_object import MemoryReadError
-from wizwalker.utils import Rectangle
+from wizwalker.utils import Rectangle, poll_until
 from wizwalker.memory.memory_objects.window import DynamicSpellListControl, DynamicDeckListControl, SpellListControlSpellEntry, DeckListControlSpellEntry, DynamicGraphicalSpellWindow
 from wizwalker.memory.memory_objects.spell import DynamicGraphicalSpell
 from wizwalker.memory.memory_objects import Window
@@ -21,6 +24,14 @@ class _ItemCardSlot:
 
 if TYPE_CHECKING:
     from wizwalker import Client
+
+
+#: How long the deck page is given to open or close after its P. It takes about
+#: a fifth of a second; this only runs out when the keypress was lost.
+DECK_PAGE_TIMEOUT = 5.0
+
+#: How often the deck page waits read.
+DECK_PAGE_POLL = 0.05
 
 
 """
@@ -210,22 +221,44 @@ class DeckBuilder:
             (vertical_spacing * ((card_number - 1) // number_of_rows))
         return x, y
 
+    async def _find_deck_config_window(self):
+        """The deck page's window, or None while the page is closed.
+
+        No retries: the answer is often no, and the default ladder slept 1.6 s to
+        give it. The window leaves the tree when the page closes.
+        """
+        try:
+            return await _maybe_get_named_window(self.client.root_window, "DeckConfiguration", retries=0)
+        except ValueError:
+            return None
+
+    async def _wait_for_deck_page(self, *, open: bool):
+        """Wait for the deck page to open or close; returns its window, or None."""
+        async def _there():
+            self._deck_config_window = await self._find_deck_config_window()
+            return (self._deck_config_window is not None) == open
+
+        await poll_until(_there, timeout=DECK_PAGE_TIMEOUT, interval=DECK_PAGE_POLL)
+        return self._deck_config_window
+
+    async def _press_spellbook_key(self):
+        async with self.client.mouse_handler:
+            await self.client.send_key(Keycode.P)
+
     async def open_deck_page(self) -> None:
         """
         Opens deck page
         """
         if self._deck_open:
             return
-        try:
-            self._deck_config_window = await _maybe_get_named_window(self.client.root_window, "DeckConfiguration")
-        except ValueError:
-            self._deck_config_window = None
+        self._deck_config_window = await self._find_deck_config_window()
 
         if not self._deck_config_window:
-            spellbook = await _maybe_get_named_window(self.client.root_window, "btnSpellbook")
-            async with self.client.mouse_handler:
-                await self.client.send_key(Keycode.P)
-            self._deck_config_window = await _maybe_get_named_window(self.client.root_window, "DeckConfiguration")
+            # in game, or the key would open nothing
+            await _maybe_get_named_window(self.client.root_window, "btnSpellbook")
+            await self._press_spellbook_key()
+            if await self._wait_for_deck_page(open=True) is None:
+                raise ValueError("No child window named DeckConfiguration")
 
         deck_button = await _maybe_get_named_window(self._deck_config_window, "Deck")
         async with self.client.mouse_handler:
@@ -235,31 +268,34 @@ class DeckBuilder:
             async with self.client.mouse_handler:
                 await self.client.mouse_handler.click_window(cards_all)
         self._deck_open = True
+        # The Deck tab was just clicked. Left False, view_deck_cards() "corrected"
+        # it by switching to the treasure cards, and callers had to set it by hand.
+        self._on_deck_page = True
 
     async def close_deck_page(self) -> None:
         if not self._deck_open:
             return
-        try:
-            self._deck_config_window = await _maybe_get_named_window(self.client.root_window, "DeckConfiguration")
-        except ValueError:
-            self._deck_config_window = None
+        self._deck_config_window = await self._find_deck_config_window()
 
         if self._deck_config_window:
-            spellbook = await _maybe_get_named_window(self.client.root_window, "btnSpellbook")
-            async with self.client.mouse_handler:
-                await self.client.send_key(Keycode.P)
+            await _maybe_get_named_window(self.client.root_window, "btnSpellbook")
+            await self._press_spellbook_key()
+            await self._wait_for_deck_page(open=False)
         # NOTE: True because the next time you open deck, it has to be on deck page
         self._on_deck_page = True
         self._deck_open = False
 
     async def refresh_deck_page(self) -> None:
-        async with self.client.mouse_handler:
-            if self._deck_open:
-                await self.client.send_key(Keycode.P)
-            await self.client.send_key(Keycode.P)
-            self._deck_open = True
-            self._on_deck_page = True
-        self._deck_config_window = await _maybe_get_named_window(self.client.root_window, "DeckConfiguration")
+        # Each P waited for: the second used to follow the first at once, and the
+        # page was then looked for while it was still opening
+        if self._deck_open:
+            await self._press_spellbook_key()
+            await self._wait_for_deck_page(open=False)
+        await self._press_spellbook_key()
+        self._deck_open = True
+        self._on_deck_page = True
+        if await self._wait_for_deck_page(open=True) is None:
+            raise ValueError("No child window named DeckConfiguration")
         # spellbook = await _maybe_get_named_window(self.client.root_window, "btnSpellbook")
         # async with self.client.mouse_handler:
         #     if self._deck_open:
@@ -427,6 +463,10 @@ class DeckBuilder:
 
     async def _go_to_item_page(self, page: int) -> None:
         """Navigate ItemSpells to a given 0-indexed page."""
+        # The sleeps after each page click stay fixed. The list's start index
+        # moves with the page, but BartleBot found a click lands on a newly
+        # shown page only some time after that index changes, so it does not say
+        # the page is ready.
         # Rewind to page 0 first
         for _ in range(50):
             try:
@@ -577,6 +617,9 @@ class DeckBuilder:
             async with self.client.mouse_handler:
                 await self.client.mouse_handler.click_window(clear_deck_button)
 
+            # The box's windows outlive it in the tree, so finding them says nothing
+            # about whether it is up: its caption does
+            await _wait_for_message_box(self.client)
             message_box_modal_window = await _maybe_get_named_window(self.client.root_window, "MessageBoxModalWindow")
             leftButton = await _maybe_get_named_window(message_box_modal_window, "leftButton")
             async with self.client.mouse_handler:
@@ -601,14 +644,17 @@ class DeckBuilder:
             async with self.client.mouse_handler:
                 await self.client.mouse_handler.click(*first_card_position)
 
-    async def clear_deck_tcs(self) -> None:
+    async def clear_deck_tcs(self, *, attempts: int = 3) -> None:
         await self.view_tc_cards()
         number_of_cards = await self.get_deck_count()
         if number_of_cards == 0:
             return
         await self.clear_deck_manual()
         # We run it again because it might be clicking to fast. It's fast enough that I dont care to run it again
-        await self.clear_deck_tcs()
+        # Bounded, as clear_deck is: one that never clears recursed until the stack ran out.
+        if attempts <= 1:
+            raise RuntimeError(f"Treasure cards still hold {number_of_cards} card(s) after clearing them")
+        await self.clear_deck_tcs(attempts=attempts - 1)
 
     async def clear_full_deck(self):
         await self.clear_deck()
@@ -789,7 +835,7 @@ class DeckBuilder:
                 break
             except ValueError:
                 await asyncio.sleep(0.25)
-        print('User has logged out and logged back in')
+        logger.info("User has logged out and logged back in")
 
     async def add_item_cards(self, section: dict) -> None:
         """Activate item card slots from a preset section. Assumes item deck has been cleared."""
@@ -841,6 +887,7 @@ class DeckBuilder:
 
     async def _go_to_spell_page(self, page: int) -> None:
         """Navigate AllPageSpellList to a 0-indexed page using PageUp/PageDown buttons."""
+        # The sleeps stay fixed; see _go_to_item_page
         for _ in range(50):
             try:
                 prev = await _maybe_get_named_window(self._deck_config_window, "PageUp")
@@ -1086,15 +1133,16 @@ class DeckBuilder:
             list_of_spell_names.append(await template.name())
             if await template.name() == name:
                 calcuated_copies = calcuated_copies + 1
-        if number_of_copies != calcuated_copies:
+        # More than the deck holds is the error. `!=` refused removing one of
+        # three copies, and let zero through to a lookup that raised.
+        if number_of_copies > calcuated_copies:
             raise ValueError(f"Trying to delete more '{name}' spells than are in the deck")
+        if not number_of_copies:
+            return
         index = list_of_spell_names.index(name)
         deck_rect = await self.get_deck_list_rectangle()
         divided_deck_rect = self.divide_rectangle(deck_rect, columns=8, rows=8)
         sign_card = divided_deck_rect[index]
-        if (not number_of_copies):
-            await asyncio.sleep(1)
-            return
         async with self.client.mouse_handler:
             for _ in range(number_of_copies):
                 await self.client.mouse_handler.click(*(sign_card.center()))
