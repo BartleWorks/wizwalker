@@ -115,7 +115,8 @@ aura_effect_types = [
 
 
 class HangingSpellEffect(Enum):
-    invalid_spell_effect = 0,
+    # The trailing comma made this (0,), so HangingSpellEffect(0) raised
+    invalid_spell_effect = 0
     absorb_damage = 35,
     absorb_heal = 36,
     add_combat_trigger_list = 85,
@@ -525,24 +526,21 @@ class ReqMinion(ConditionalSpellEffectRequirement):
             case MinionType.has_minion:
                 # TODO find out what in the world this means
                 raise NotImplementedError()
+            # These two never held. is_minion() went unawaited, a coroutine and so
+            # always true, and behind a test of each member against a fresh
+            # get_members(), whose new objects no member is ever equal to.
             case MinionType.on_team:
+                team = await participant.team_id()
                 for combatmember in await combat.get_members():
-                    if combatmember in await combat.get_members():
-                        part = await combatmember.get_participant()
-                        if (
-                            combatmember.is_minion()
-                            and await part.team_id() == await participant.team_id()
-                        ):
-                            return True
+                    part = await combatmember.get_participant()
+                    if await combatmember.is_minion() and await part.team_id() == team:
+                        return True
             case MinionType.on_other_team:
+                team = await participant.team_id()
                 for combatmember in await combat.get_members():
-                    if combatmember in await combat.get_members():
-                        part = await combatmember.get_participant()
-                        if (
-                            combatmember.is_minion()
-                            and not await part.team_id() == await participant.team_id()
-                        ):
-                            return True
+                    part = await combatmember.get_participant()
+                    if await combatmember.is_minion() and await part.team_id() != team:
+                        return True
             case MinionType.on_any_team:
                 for combatmember in await combat.get_members():
                     if await combatmember.is_minion():
