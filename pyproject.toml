@@ -28,4 +28,10 @@ build-backend = "hatchling.build"
 dev = [
     "pywin32-ctypes>=0.2.2",
     "pdoc>=14.5.0",
+    "pytest>=9.0",
+    "pytest-asyncio>=1.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
