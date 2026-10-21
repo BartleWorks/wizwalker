@@ -1,6 +1,6 @@
 import pytest
 
-from wizwalker import AddressOutOfRange, ClientClosedError, MemoryReadError, MemoryWriteError
+from wizwalker import AddressOutOfRange, ClientClosedError, MemoryReadError, MemoryWriteError, utils
 from wizwalker.constants import Primitive
 from wizwalker.memory.memory_reader import MemoryReader
 
@@ -44,6 +44,44 @@ async def test_typed_values_round_trip(reader, process):
     await reader.write_typed(0x1008, 1.5, Primitive.float64)
     assert await reader.read_typed(0x1000, Primitive.int32) == -2
     assert await reader.read_typed(0x1008, Primitive.float64) == 1.5
+
+
+class Module:
+    lpBaseOfDll = 0x7FFA_0000_0000
+
+
+@pytest.fixture
+def loaded(monkeypatch):
+    """Every module counts as loaded in the fake process, at Module's base."""
+    import pymem.process
+
+    monkeypatch.setattr(pymem.process, "module_from_name", lambda handle, name: Module())
+
+
+async def test_finds_a_symbol_in_a_system_dll(reader, loaded):
+    address = await reader.get_address_from_symbol("user32.dll", "GetCursorPos")
+    assert address > Module.lpBaseOfDll
+
+
+async def test_takes_the_module_folder_as_a_str(reader, loaded):
+    # It did module_dir / module_name, which a str can't
+    folder = str(utils.get_system_directory())
+    assert await reader.get_address_from_symbol("user32.dll", "GetCursorPos", module_dir=folder) > 0
+
+
+async def test_an_unknown_module_or_symbol_is_a_value_error(reader, loaded, tmp_path):
+    with pytest.raises(ValueError):
+        await reader.get_address_from_symbol("user32.dll", "GetCursorPos", module_dir=str(tmp_path))
+    with pytest.raises(ValueError):
+        await reader.get_address_from_symbol("user32.dll", "NoSuchExport")
+
+
+async def test_a_module_not_loaded_in_the_process_is_a_value_error(reader, monkeypatch):
+    import pymem.process
+
+    monkeypatch.setattr(pymem.process, "module_from_name", lambda handle, name: None)
+    with pytest.raises(ValueError):
+        await reader.get_address_from_symbol("user32.dll", "GetCursorPos")
 
 
 async def test_allocate_and_free_go_to_the_process(reader, process):

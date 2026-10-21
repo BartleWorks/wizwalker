@@ -2,6 +2,7 @@ import asyncio
 import functools
 import regex
 import struct
+from pathlib import Path
 from typing import Any, Union
 
 import pefile
@@ -224,7 +225,8 @@ class MemoryReader:
         if not module_dir:
             module_dir = utils.get_system_directory()
 
-        file_path = module_dir / module_name
+        # The annotation says str, and a str has no / operator
+        file_path = Path(module_dir) / module_name
 
         if not file_path.exists():
             raise ValueError(f"No module named {module_name}")
