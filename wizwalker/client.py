@@ -446,6 +446,11 @@ class Client:
         if name is None:
             name = await self.zone_name()
 
+        # None means no pause between reads, not asyncio.sleep(None), which raised.
+        # Zero still yields, so the reads don't hold the event loop.
+        if sleep_time is None:
+            sleep_time = 0
+
         while await self.zone_name() == name:
             await asyncio.sleep(sleep_time)
 
