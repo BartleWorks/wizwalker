@@ -7,6 +7,7 @@ from contextlib import suppress
 import warnings
 
 from loguru import logger
+import regex
 
 from .memory_reader import MemoryReader
 from wizwalker.constants import kernel32
@@ -343,14 +344,30 @@ class RenderContextHook(SimpleHook):
 
 
 class MovementTeleportHook(SimpleHook):
-    pattern = rb"\x57\x48\x83\xEC.\x48\x8B\x99...." \
-              rb"\x48\x85\xDB\x74.\x4C\x8B\x43.\x48\x8B\x5B"\
-              rb".\x48\x85\xDB\x74.\xF0\xFF\x43.\x4D\x85" \
-              rb"\xC0\x74.\xF2\x0F\x10\x02\xF2\x41\x0F\x11\x40" \
-              rb".\x8B\x42.\x41\x89\x40.\x41\xC6\x80."
+    # The client object's set-position function (rcx the object, rdx the new position),
+    # hooked at its first instruction after the prologue, `mov rbx, [rcx+0x1B8]`: the
+    # prologue differs between r806919 and r811339, which recompiled it with a longer
+    # frame, and this does not. Nothing has read [rdx] yet there, and the instruction
+    # is not RIP-relative, so it replays as is from the cave (bytecode_generator reads
+    # it from the site). Matches once on both builds.
+    pattern = (
+        rb"\x48\x8B\x99....\x48\x85\xDB\x74.\x4C\x8B\x43.\x48\x8B\x5B.\x48\x85\xDB\x74.\xF0\xFF\x43."
+    )
 
-    instruction_length = 5
-    noops = 0
+    # The collision check the teleport switches off: the `je` after the collision
+    # object's [rax+0x10] call that is handed a stack buffer (`lea r8, [rsp+?]`). The
+    # movement function has a second such block whose call takes r8 from a register,
+    # which r811339 compiled with the stack slots this used to name, so the pattern
+    # names the lea instead. A fixed-width lookbehind, to stay a valid `re` pattern.
+    INSIDE_EVENT_JE_PATTERN = rb"(?<=\x4C\x8D\x44\x24.\x48\x8D\x55.\xFF\x50\x10\x84\xC0)\x74."
+    # The same block's event dispatch: the first `call [rax+0x18]; test al, al; je`
+    # after it. Found from the check rather than by its own pattern, since the stack
+    # slot that pattern named belongs to the other block on r811339.
+    EVENT_DISPATCH_JE = rb"\xFF\x50\x18\x84\xC0(?=\x74)"
+    EVENT_DISPATCH_WITHIN = 0x100
+
+    instruction_length = 7
+    noops = 2
     # position vector = 12 + 1 for update bool + 8 for target object address
     exports = [("teleport_helper", 21)]
 
@@ -395,14 +412,10 @@ class MovementTeleportHook(SimpleHook):
         target_address = jes[0]
 
         inside_event_je_addr = await self.pattern_scan(
-            rb"\x74.\xF3\x0F\x10\x55\xA8",
+            self.INSIDE_EVENT_JE_PATTERN,
             module="WizardGraphicalClient.exe",
         )
-        
-        event_dispatch_je_addr = await self.pattern_scan(
-            rb"\x74.\xF3\x0F\x10\x44\x24\x54\xF3\x0F",
-            module="WizardGraphicalClient.exe",
-        )
+        event_dispatch_je_addr = await self._event_dispatch_je_after(inside_event_je_addr)
 
         old_inside_event_je_bytes = await self.read_bytes(inside_event_je_addr, 2)
         old_event_dispatch_je_addr = await self.read_bytes(event_dispatch_je_addr, 2)
@@ -415,6 +428,15 @@ class MovementTeleportHook(SimpleHook):
 
         # 0x40 is read, write, execute
         self._old_je_page_protection = self._set_page_protection(target_address, 0x40)
+
+    async def _event_dispatch_je_after(self, inside_event_je_addr: int) -> int:
+        following = await self.read_bytes(inside_event_je_addr, self.EVENT_DISPATCH_WITHIN)
+        found = regex.search(self.EVENT_DISPATCH_JE, following, regex.DOTALL)
+        if found is None:
+            raise RuntimeError(
+                f"No event dispatch je within {self.EVENT_DISPATCH_WITHIN:#x} bytes of the collision check"
+            )
+        return inside_event_je_addr + found.end()
 
     async def bytecode_generator(self, packed_exports):
         # The helper's fields, offset from the whole address. Adding to its low byte
@@ -434,6 +456,9 @@ class MovementTeleportHook(SimpleHook):
 
         packed_jes_and = struct.pack("<Q", jes[0])
         packed_jes_cmp = struct.pack("<Q", jes[1])
+
+        # The instruction the jump overwrites, replayed before returning
+        original = await self.hook_handler.read_bytes(self.jump_address, self.instruction_length)
 
         # fmt: off
         bytecode = (
@@ -463,8 +488,7 @@ class MovementTeleportHook(SimpleHook):
             b"\x48\xB8" + jes_cmp_bytes +
             b"\x48\xA3" + packed_jes_cmp +
             b"\x58" # pop rax
-            b"\x57" # push rdi (original bytes)
-            b"\x48\x83\xEC\x20" # sub rsp,20 (original bytes)
+            + original
         )
         # fmt: on
 
@@ -536,14 +560,25 @@ class MovementTeleportHook(SimpleHook):
 
 
 class DropsToggleHook(SimpleHook):
-    pattern = rb"\x4C\x8B\xDC\x48\x83\xEC\x68\x48\x8B\x05...." \
-              rb"\x48\x33\xC4\x48\x89\x44\x24.\x48\x8D\x05...."
+    # The function that sends the "Loot" event, hooked at its entry so that it returns 0
+    # at once while drops are disabled. It names no string in .rdata on r806919, which
+    # builds "Loot" from an immediate, and loads it with `lea rdx, [rip+"Loot"]` on
+    # r811339; this runs from r811339's prologue through that string's setup (length 4)
+    # and matches once. The jump overwrites `sub rsp, 0x68` and the EH state store after
+    # it, 13 bytes, neither RIP-relative, replayed from the site.
+    pattern = (
+        rb"\x48\x83\xEC\x68\x48\xC7\x44\x24.\xFE\xFF\xFF\xFF\x48\x8B\x05....\x48\x33\xC4\x48\x89\x44\x24."
+        rb"\x48\x8D\x05....\x48\x89\x44\x24.\x48\x89\x54\x24."
+        rb"\x66\x0F\x6F\x05....\xF3\x0F\x7F\x44\x24.\xC6\x44\x24.\x00\x41\xB8\x04\x00\x00\x00\x48\x8D\x15...."
+    )
 
-    instruction_length = 7
+    instruction_length = 13
     exports = [("disable_drops_bool", 1)]
-    noops = 2
+    noops = 8
 
     async def bytecode_generator(self, packed_exports):
+        # The instructions the jump overwrites, replayed when drops are not disabled
+        original = await self.hook_handler.read_bytes(self.jump_address, self.instruction_length)
         return (
             b"\x50" # push rax
             b"\xA0" + packed_exports[0][1] + # mov al,[disable_drops_bool]
@@ -552,8 +587,7 @@ class DropsToggleHook(SimpleHook):
             b"\x0F\x84\x04\x00\x00\x00" # je down 4
             b"\x48\x31\xC0" # xor rax,rax
             b"\xC3" # ret
-            b"\x4C\x8B\xDC" # mov r11,rsp (original bytes)
-            b"\x48\x83\xEC\x68" # sub rsp,68 (original bytes)
+            + original
         )
 
 
