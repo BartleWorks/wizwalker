@@ -1,5 +1,4 @@
 from warnings import warn
-from functools import partial
 
 import wizwalker
 
@@ -39,14 +38,20 @@ class CombatMember:
         Get the health text window
         Useful for targeting
         """
-        possible = await wizwalker.utils.maybe_wait_for_any_value_with_timeout(
-            partial(self._combatant_control.get_windows_with_name, "Health"), timeout=5
-        )
+        async def _health_windows():
+            # None while there are none: the search answers [], which is not None,
+            # so waiting on it directly returned at once and never waited at all
+            return await self._combatant_control.get_windows_with_name("Health") or None
 
-        if possible:
-            return possible[0]
+        try:
+            possible = await wizwalker.utils.maybe_wait_for_any_value_with_timeout(
+                _health_windows, sleep_time=0.1, timeout=5
+            )
+        except wizwalker.errors.ExceptionalTimeout:
+            # The ValueError callers have always been handed for a missing window
+            raise ValueError("Couldn't find health child")
 
-        raise ValueError("Couldn't find health child")
+        return possible[0]
 
     async def get_name_text_window(self) -> "wizwalker.memory.DynamicWindow":
         """
