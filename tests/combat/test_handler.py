@@ -26,7 +26,7 @@ async def test_the_card_windows_are_found_once_a_fight():
     root = Window("root", children=[spell("a")])
     handler = CombatHandler(Client(root))
     await handler.get_cards()
-    root.children.append(spell("b"))
+    root.add(spell("b"))
     assert len(await handler.get_cards()) == 1
 
 

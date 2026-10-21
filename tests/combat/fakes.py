@@ -1,37 +1,8 @@
 """A client in combat, from the outside: windows, a mouse that records, a duel."""
 
-from wizwalker.memory.memory_objects.enums import DuelPhase, WindowFlags
+from wizwalker.memory.memory_objects.enums import DuelPhase
 
-
-class Window:
-    def __init__(self, name: str = "", *, type_name: str = "Window", visible: bool = True, children=()):
-        self._name = name
-        self.type_name = type_name
-        self.visible = visible
-        self.children = list(children)
-
-    def __repr__(self):
-        return f"<Window {self._name}>"
-
-    async def name(self):
-        return self._name
-
-    async def flags(self):
-        return WindowFlags.visible if self.visible else WindowFlags(0)
-
-    async def is_visible(self):
-        return self.visible
-
-    def _walk(self):
-        for child in self.children:
-            yield child
-            yield from child._walk()
-
-    async def get_windows_with_name(self, name):
-        return [w for w in self._walk() if w._name == name]
-
-    async def get_windows_with_type(self, type_name):
-        return [w for w in self._walk() if w.type_name == type_name]
+from ..fake_windows import Window
 
 
 class Mouse:

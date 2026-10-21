@@ -3,7 +3,12 @@ import regex
 from contextlib import suppress
 
 from wizwalker.memory.memory_objects.enums import WindowFlags
-from wizwalker.utils import maybe_wait_for_value_with_timeout
+from wizwalker.utils import maybe_wait_for_value_with_timeout, poll_until
+
+
+#: How long a click in the friends list is given to show: a page turned, the
+#: list opened, a friend's profile up. Each was a fixed wait or none at all.
+FRIENDS_LIST_TIMEOUT = 1.0
 
 
 _friend_list_entry = regex.compile(
@@ -80,9 +85,43 @@ async def _cycle_to_online_friends(client, friends_list):
         )
 
 
+def _parse_page_number(text: str) -> tuple[int, int]:
+    """(current page, page count) from the list's `<center>2 / 3</center>`."""
+    current, count = map(
+        int, text.replace("<center>", "").replace("</center>", "").replace(" ", "").split("/")
+    )
+    return current, count
+
+
+async def _friends_window_of(friends_list):
+    """The NewFriendsListWindow a listFriends sits in, or None."""
+    with suppress(Exception):
+        for parent in await friends_list.get_parents():
+            if await parent.name() == "NewFriendsListWindow":
+                return parent
+    return None
+
+
+async def _turn_friends_page(client, button, page_number):
+    """Click a page button, then wait for the page number to change."""
+    before = await page_number.maybe_text() if page_number else None
+    await client.mouse_handler.click_window(button)
+    if page_number is None:
+        return
+
+    async def _turned():
+        return await page_number.maybe_text() != before
+
+    await poll_until(_turned, timeout=FRIENDS_LIST_TIMEOUT)
+
+
 async def _cycle_friends_list(
     client, right_button, friends_list, icon, icon_list, name, current_page
 ):
+    """Find a friend in the list and page to them; returns (entry, index) or (None, index).
+
+    The list's text holds every friend online, ten to a page, whatever page shows.
+    """
     list_text = await friends_list.maybe_text()
 
     match = None
@@ -119,8 +158,24 @@ async def _cycle_friends_list(
         target_page = (idx // 10) + 1
 
         if target_page != current_page:
-            for _ in range(target_page - current_page):
-                await client.mouse_handler.click_window(right_button)
+            friends_window = await _friends_window_of(friends_list)
+            page_number = None
+            if friends_window is not None:
+                with suppress(ValueError):
+                    page_number = await _maybe_get_named_window(friends_window, "PageNumber", retries=0)
+
+            if target_page > current_page:
+                button, turns = right_button, target_page - current_page
+            else:
+                # A list left on a later page used to stay there, and the friend's
+                # row was clicked on it: whoever sat there was ported to instead.
+                if friends_window is None:
+                    raise ValueError("The friend is on an earlier page, and there is no way back to it")
+                button = await _maybe_get_named_window(friends_window, "btnArrowUp")
+                turns = current_page - target_page
+
+            for _ in range(turns):
+                await _turn_friends_page(client, button, page_number)
 
     return match, idx
 
@@ -137,8 +192,38 @@ async def _click_on_friend(client, friends_list, friend_index):
     # 15 is half the size of each entry's click area
     click_y = int(scaled_rect.y1 + scaled_friend_name_y + (15 * ui_scale))
 
+    # The profile popup stays in the window tree when closed, so what says this
+    # click opened it is the popup showing, or showing someone else than before.
+    # Up to the second this used to sleep regardless; the full second only when
+    # it was already showing this friend.
+    popup = await _find_character_window(client)
+    before = await _character_window_state(popup)
     await client.mouse_handler.click(click_x, click_y)
-    await asyncio.sleep(1)
+
+    async def _opened():
+        nonlocal popup
+        # Found once: every search walks the whole window tree
+        if popup is None:
+            popup = await _find_character_window(client)
+        now = await _character_window_state(popup)
+        return now is not None and (before is None or now != before)
+
+    await poll_until(_opened, timeout=FRIENDS_LIST_TIMEOUT)
+
+
+async def _find_character_window(client):
+    windows = await client.root_window.get_windows_with_name("wndCharacter")
+    return windows[0] if len(windows) == 1 else None
+
+
+async def _character_window_state(popup):
+    """The name the friend profile popup shows, or None while it is closed."""
+    if popup is None or not await popup.is_visible():
+        return None
+
+    labels = await popup.get_windows_with_name("lblCharacterName")
+    # Shown, but nameless, still differs from closed
+    return await labels[0].maybe_text() if len(labels) == 1 else ""
 
 
 async def _message_box_caption(client):
@@ -164,14 +249,7 @@ async def _wait_for_message_box(client, timeout: float = 3.0, interval: float = 
     Gives up quietly after *timeout*, leaving the caller's own lookup to report a box
     that never came.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-
-    while loop.time() < deadline:
-        if await _message_box_caption(client):
-            return
-
-        await asyncio.sleep(interval)
+    await poll_until(lambda: _message_box_caption(client), timeout=timeout, interval=interval)
 
 
 async def _teleport_to_friend(client, character_window):
@@ -232,6 +310,8 @@ async def teleport_to_friend_from_list(
             # friend's list isn't open so open it
             friend_button = await _maybe_get_named_window(client.root_window, "btnFriends")
             await client.mouse_handler.click_window(friend_button)
+            # It was read straight after the click, before it had opened
+            await poll_until(friends_window.is_visible, timeout=FRIENDS_LIST_TIMEOUT)
 
     await _cycle_to_online_friends(client, friends_window)
 
@@ -245,15 +325,7 @@ async def teleport_to_friend_from_list(
     right_button = await _maybe_get_named_window(friends_window, "btnArrowDown")
     page_number = await _maybe_get_named_window(friends_window, "PageNumber")
 
-    page_number_text = await page_number.maybe_text()
-
-    current_page, _ = map(
-        int,
-        page_number_text.replace("<center>", "")
-        .replace("</center>", "")
-        .replace(" ", "")
-        .split("/"),
-    )
+    current_page, _ = _parse_page_number(await page_number.maybe_text())
 
     friend, friend_index = await _cycle_friends_list(
         client,
