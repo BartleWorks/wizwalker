@@ -8,6 +8,12 @@ from ..memory import DuelPhase, EffectTarget, SpellEffects, WindowFlags
 from wizwalker import utils, WizWalkerMemoryError, MemoryInvalidated, MemoryReadError, ReadingEnumFailed
 
 
+#: How often the round waits read the duel. Each wait ends on average half an
+#: interval after the change it waits for, twice a round, and at 0.5 s that was
+#: half a second a round spent noticing.
+ROUND_POLL_INTERVAL = 0.2
+
+
 class CombatHandler:
     """
     Handles client's battles
@@ -43,7 +49,7 @@ class CombatHandler:
 
         self._spell_check_boxes = None
 
-    async def wait_for_planning_phase(self, sleep_time: float = 0.5):
+    async def wait_for_planning_phase(self, sleep_time: float = ROUND_POLL_INTERVAL):
         """
         Wait for the duel to enter the planning phase
 
@@ -73,7 +79,7 @@ class CombatHandler:
         await utils.wait_for_value(self.in_combat, True, sleep_time)
         await self.handle_combat()
 
-    async def wait_until_next_round(self, current_round: int, sleep_time: float = 0.5):
+    async def wait_until_next_round(self, current_round: int, sleep_time: float = ROUND_POLL_INTERVAL):
         """
         Wait for the round number to change
         """
@@ -477,7 +483,7 @@ class AoeHandler(CombatHandler):
     Subclass of CombatHandler that just casts enchanted aoes
     """
 
-    async def _wait_for_non_planning_phase(self, sleep_time: float = 0.5):
+    async def _wait_for_non_planning_phase(self, sleep_time: float = ROUND_POLL_INTERVAL):
         while True:
             try:
                 phase = await self.client.duel.duel_phase()
