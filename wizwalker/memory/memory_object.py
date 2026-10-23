@@ -91,38 +91,77 @@ class MemoryObject(MemoryReader):
         string_bytes = search_bytes[:string_end]
         return string_bytes.decode(encoding)
 
-    async def read_wide_string(self, address: int, encoding: str = "utf-16") -> str:
+    async def read_wide_string(
+        self, address: int, encoding: str = "utf-16", *, max_len: int = MAX_STRING
+    ) -> str:
         # wide chars take 2 bytes
-        return await self._read_basic_string(address, 2, WIDE_BUF_CHARS, encoding)
+        text, _cut = await self._read_basic_string(
+            address, 2, WIDE_BUF_CHARS, encoding, max_len=max_len
+        )
+        return text
+
+    async def read_wide_string_tail(
+        self, address: int, chars: int, encoding: str = "utf-16", *, max_len: int = MAX_STRING
+    ) -> tuple[str, bool]:
+        """The last `chars` characters of the wide string at `address`, and whether any
+        came before them.
+
+        For a string that only ever grows at the end, such as the chat log, whose
+        reader wants what arrived lately and not the whole of it. Only the tail is
+        read, so `max_len` may be raised far past MAX_STRING without a large read: it
+        still refuses a length no real string has, but the buffer allocated is
+        `chars` long. A tail that is cut may begin partway through whatever the
+        string holds, so a caller that splits it into lines drops the first.
+        """
+        return await self._read_basic_string(
+            address, 2, WIDE_BUF_CHARS, encoding, max_len=max_len, tail=chars
+        )
 
     async def _read_basic_string(
-        self, address: int, char_size: int, buf_chars: int, encoding: str
-    ) -> str:
+        self,
+        address: int,
+        char_size: int,
+        buf_chars: int,
+        encoding: str,
+        *,
+        max_len: int = MAX_STRING,
+        tail: int = None,
+    ) -> tuple[str, bool]:
         """Read the MSVC std::basic_string at `address`, laid out as _string_data_address
         describes, in one read when it is inline and two when it is not.
 
-        The length is bounded: a stale or wrong address can hold any length, and pymem
-        allocates a buffer of whatever size it is asked for.
+        The length is bounded by `max_len`: a stale or wrong address can hold any
+        length, and pymem allocates a buffer of whatever size it is asked for. A string
+        longer than that reads empty, so a caller expecting a long one raises it.
+
+        With `tail`, only the last `tail` characters are read. Returns the text and
+        whether characters before it were left unread.
         """
         header = await self.read_bytes(address, 32)
         string_len = struct.unpack_from("<i", header, 16)[0]
-        if not 1 <= string_len <= MAX_STRING:
-            return ""
+        if not 1 <= string_len <= max_len:
+            return "", False
 
-        byte_len = string_len * char_size
+        skip = string_len - tail if tail is not None and string_len > tail else 0
+        byte_len = (string_len - skip) * char_size
         capacity = struct.unpack_from("<Q", header, 24)[0]
         if capacity >= buf_chars:
-            data = await self.read_bytes(struct.unpack_from("<q", header, 0)[0], byte_len)
-        elif byte_len < 16:
-            data = header[:byte_len]
+            data_address = struct.unpack_from("<q", header, 0)[0] + skip * char_size
+            data = await self.read_bytes(data_address, byte_len)
+        elif string_len * char_size < 16:
+            data = header[skip * char_size : string_len * char_size]
         else:
             # inline, yet longer than the buffer it would live in: not a string
-            return ""
+            return "", False
+
+        if skip and char_size == 2 and 0xDC00 <= struct.unpack_from("<H", data)[0] <= 0xDFFF:
+            # The cut fell inside a surrogate pair, and its second half alone does not decode.
+            data = data[2:]
 
         try:
-            return data.decode(encoding)
+            return data.decode(encoding), skip > 0
         except UnicodeDecodeError:
-            return ""
+            return "", False
 
     async def _string_data_address(self, address: int, buf_chars: int) -> int:
         """Where a std::basic_string at `address` actually keeps its characters.
@@ -209,7 +248,8 @@ class MemoryObject(MemoryReader):
         await self.write_wide_string(base_address + offset, string, encoding)
 
     async def read_string(self, address: int, encoding: str = "utf-8") -> str:
-        return await self._read_basic_string(address, 1, NARROW_BUF_CHARS, encoding)
+        text, _cut = await self._read_basic_string(address, 1, NARROW_BUF_CHARS, encoding)
+        return text
 
     async def read_string_from_offset(
         self, offset: int, encoding: str = "utf-8"
