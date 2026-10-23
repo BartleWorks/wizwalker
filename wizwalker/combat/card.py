@@ -88,10 +88,10 @@ class CombatCard:
                 if sleep_time is not None:
                     await asyncio.sleep(sleep_time)
 
-            confirm_window = (await self.combat_handler.client.root_window.get_windows_with_name("ConfirmTargetsWindow"))[0]
-            if await confirm_window.is_visible():
+            confirm_window = await self.combat_handler.get_confirm_targets_window()
+            if confirm_window is not None and await confirm_window.is_visible():
                 try:
-                    await self.combat_handler.client.mouse_handler.click_window_with_name("ConfirmTargetsConfirm")
+                    await self.combat_handler.click_confirm_targets()
                 except ValueError:
                     pass
 

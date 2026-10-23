@@ -49,6 +49,14 @@ class Window:
             yield child
             yield from child._walk()
 
+    def forbid_searches(self) -> "Window":
+        """Make a search of everything under this window fail the test."""
+        async def searched(name):
+            raise AssertionError(f"the whole UI was searched for {name}")
+
+        self.get_windows_with_name = self.get_windows_with_type = searched
+        return self
+
     # --- what Window offers --------------------------------------------------
 
     async def name(self):

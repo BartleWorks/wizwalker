@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
-from wizwalker.extensions.scripting.utils import _maybe_get_named_window, _wait_for_message_box
+from wizwalker.extensions.scripting.utils import (
+    _maybe_get_named_window,
+    _maybe_get_window_at_path,
+    _wait_for_message_box,
+)
+from wizwalker.memory.memory_objects.window import window_at_path
 from wizwalker.memory.memory_object import MemoryReadError
 from wizwalker.utils import Rectangle, poll_until
 from wizwalker.memory.memory_objects.window import DynamicSpellListControl, DynamicDeckListControl, SpellListControlSpellEntry, DeckListControlSpellEntry, DynamicGraphicalSpellWindow
@@ -32,6 +37,19 @@ DECK_PAGE_TIMEOUT = 5.0
 
 #: How often the deck page waits read.
 DECK_PAGE_POLL = 0.05
+
+# Windows by their paths from the root of the UI. A search of the whole UI by name took
+# about 30 ms a time, and the deck page's was made once per item card toggled.
+
+#: The deck page. It leaves the tree when the page closes.
+DECK_CONFIGURATION_PATH = ("WorldView", "DeckConfiguration")
+#: The spellbook button on the HUD, there whenever the client is in the world.
+SPELLBOOK_BUTTON_PATH = ("WorldView", "windowHUD", "btnSpellbook")
+#: The box asking whether to clear the deck, and its Yes.
+CLEAR_DECK_BOX_PATH = ("WorldView", "MessageBoxModalWindow")
+CLEAR_DECK_YES_PATH = (
+    *CLEAR_DECK_BOX_PATH, "messageBoxBG", "messageBoxLayout", "AdjustmentWindow", "Layout", "centerButton"
+)
 
 
 """
@@ -227,10 +245,16 @@ class DeckBuilder:
         No retries: the answer is often no, and the default ladder slept 1.6 s to
         give it. The window leaves the tree when the page closes.
         """
-        try:
-            return await _maybe_get_named_window(self.client.root_window, "DeckConfiguration", retries=0)
-        except ValueError:
-            return None
+        return await window_at_path(self.client.root_window, DECK_CONFIGURATION_PATH)
+
+    async def _get_deck_config_window(self):
+        """The deck page's window, waited for as a lookup by name is; ValueError if it never shows."""
+        self._deck_config_window = await _maybe_get_window_at_path(self.client.root_window, DECK_CONFIGURATION_PATH)
+        return self._deck_config_window
+
+    async def _require_spellbook_button(self):
+        """Raise ValueError unless the HUD's spellbook button is there: out of the world, P opens nothing."""
+        await _maybe_get_window_at_path(self.client.root_window, SPELLBOOK_BUTTON_PATH)
 
     async def _wait_for_deck_page(self, *, open: bool):
         """Wait for the deck page to open or close; returns its window, or None."""
@@ -254,8 +278,7 @@ class DeckBuilder:
         self._deck_config_window = await self._find_deck_config_window()
 
         if not self._deck_config_window:
-            # in game, or the key would open nothing
-            await _maybe_get_named_window(self.client.root_window, "btnSpellbook")
+            await self._require_spellbook_button()
             await self._press_spellbook_key()
             if await self._wait_for_deck_page(open=True) is None:
                 raise ValueError("No child window named DeckConfiguration")
@@ -278,7 +301,7 @@ class DeckBuilder:
         self._deck_config_window = await self._find_deck_config_window()
 
         if self._deck_config_window:
-            await _maybe_get_named_window(self.client.root_window, "btnSpellbook")
+            await self._require_spellbook_button()
             await self._press_spellbook_key()
             await self._wait_for_deck_page(open=False)
         # NOTE: True because the next time you open deck, it has to be on deck page
@@ -312,7 +335,7 @@ class DeckBuilder:
         async with self.client.mouse_handler:
             await self.client.mouse_handler.click_window(treasure_card_button)
         await asyncio.sleep(0.5)
-        self._deck_config_window = await _maybe_get_named_window(self.client.root_window, "DeckConfiguration")
+        await self._get_deck_config_window()
         self._on_deck_page = not self._on_deck_page
 
     async def view_deck_cards(self) -> None:
@@ -438,7 +461,7 @@ class DeckBuilder:
                 idx = int((max-min)/2+min)
 
     async def get_deck_spell_list(self) -> list[DeckListControlSpellEntry]:
-        cards_in_deck_window = await _maybe_get_named_window(self.client.root_window, "CardsInDeck")
+        cards_in_deck_window = await _maybe_get_named_window(await self._get_deck_config_window(), "CardsInDeck")
         deck_list_control = DynamicDeckListControl(self.client.hook_handler, await cards_in_deck_window.read_base_address())
         list_of_deck_spell_entries = await deck_list_control.spell_entries()
         list_of_valid_deck_spell_entries = []
@@ -619,11 +642,10 @@ class DeckBuilder:
 
             # The box's windows outlive it in the tree, so finding them says nothing
             # about whether it is up: its caption does
-            await _wait_for_message_box(self.client)
-            message_box_modal_window = await _maybe_get_named_window(self.client.root_window, "MessageBoxModalWindow")
-            leftButton = await _maybe_get_named_window(message_box_modal_window, "leftButton")
+            await _wait_for_message_box(self.client, box_path=CLEAR_DECK_BOX_PATH)
+            yes_button = await _maybe_get_window_at_path(self.client.root_window, CLEAR_DECK_YES_PATH)
             async with self.client.mouse_handler:
-                await self.client.mouse_handler.click_window(leftButton)
+                await self.client.mouse_handler.click_window(yes_button)
         except Exception:
             number_of_cards = await self.get_deck_count()
             if number_of_cards == 0:
@@ -747,22 +769,19 @@ class DeckBuilder:
 
     async def get_spell_list_rectangle(self) -> Rectangle:
         # Returns the size of the window as a rectangle so we can subdivide it later
-        self._deck_config_window = await _maybe_get_named_window(self.client.root_window, "DeckConfiguration")
-        self.spell_list = await _maybe_get_named_window(self._deck_config_window, "AllPageSpellList")
+        self.spell_list = await _maybe_get_named_window(await self._get_deck_config_window(), "AllPageSpellList")
         self.spell_list_scaled = await self.spell_list.scale_to_client()
         return self.spell_list_scaled
 
     async def get_deck_list_rectangle(self) -> Rectangle:
         # Returns the size of the window as a rectangle so we can subdivide it later
-        self._deck_config_window = await _maybe_get_named_window(self.client.root_window, "DeckConfiguration")
-        self.deck_list = await _maybe_get_named_window(self._deck_config_window, "CardsInDeck")
+        self.deck_list = await _maybe_get_named_window(await self._get_deck_config_window(), "CardsInDeck")
         self.deck_list_scaled = await self.deck_list.scale_to_client()
         return self.deck_list_scaled
 
     async def get_item_spells_rectangle(self) -> Rectangle:
         # Returns the size of the window as a rectangle so we can subdivide it later
-        self._deck_config_window = await _maybe_get_named_window(self.client.root_window, "DeckConfiguration")
-        self.deck_list = await _maybe_get_named_window(self._deck_config_window, "ItemSpells")
+        self.deck_list = await _maybe_get_named_window(await self._get_deck_config_window(), "ItemSpells")
         self.deck_list_scaled = await self.deck_list.scale_to_client()
         return self.deck_list_scaled
 
@@ -831,7 +850,7 @@ class DeckBuilder:
             await self.client.mouse_handler.click_window(play_button)
         while True:
             try:
-                await _maybe_get_named_window(self.client.root_window, "btnSpellbook")
+                await self._require_spellbook_button()
                 break
             except ValueError:
                 await asyncio.sleep(0.25)

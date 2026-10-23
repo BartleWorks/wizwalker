@@ -1,6 +1,6 @@
 import struct
-from typing import Callable, List, Optional
-from contextlib import suppress
+from typing import AsyncIterator, Callable, List, Optional, Sequence
+from contextlib import aclosing, suppress
 
 from loguru import logger
 
@@ -13,7 +13,44 @@ from wizwalker.memory.memory_object import (
 from .enums import WindowFlags, WindowStyle
 from .spell import DynamicGraphicalSpell
 from .combat_participant import DynamicCombatParticipant
-from wizwalker import AddressOutOfRange, MemoryReadError, Rectangle, utils
+from wizwalker import AddressOutOfRange, MemoryReadError, Rectangle, WizWalkerMemoryError, utils
+
+
+async def iter_windows_at_path(parent, path: Sequence[str]) -> AsyncIterator["Window"]:
+    """Every window at `path` under `parent`, matched by name one level at a time, in tree order.
+
+    Depth-first, backing out of a branch that does not complete the path, since siblings
+    can share a name. A few dozen reads, where a search of the whole UI by name is
+    thousands. A window that cannot be read is a branch that does not complete it.
+    """
+    if not path:
+        yield parent
+        return
+    try:
+        children = await parent.children()
+    except (ValueError, WizWalkerMemoryError):
+        return
+    for child in children:
+        try:
+            matches = await child.name() == path[0]
+        except (ValueError, WizWalkerMemoryError):
+            continue
+        if matches:
+            async for window in iter_windows_at_path(child, path[1:]):
+                yield window
+
+
+async def window_at_path(parent, path: Sequence[str]) -> Optional["Window"]:
+    """The first window at `path` under `parent`, or None. See `iter_windows_at_path`."""
+    async with aclosing(iter_windows_at_path(parent, path)) as windows:
+        async for window in windows:
+            return window
+    return None
+
+
+async def windows_at_path(parent, path: Sequence[str]) -> List["Window"]:
+    """Every window at `path` under `parent`. See `iter_windows_at_path`."""
+    return [window async for window in iter_windows_at_path(parent, path)]
 
 
 # TODO: Window.click
