@@ -38,6 +38,7 @@ from .memory.memory_objects.core_object import CoreObject
 from .memory.memory_objects.game_object_template import WizGameObjectTemplate
 from .memory.memory_objects.enums import ObjectType
 from .mouse_handler import MouseHandler
+from .window_messages import forget_window
 from .utils import (
     XYZ,
     check_if_process_running,
@@ -263,6 +264,8 @@ class Client:
         """
         Closes this client; unhooking all active hooks
         """
+        # nothing more is sent to the window through this client, so its worker can go
+        forget_window(self.window_handle)
         # if the client isn't running there isn't anything to unhook
         if not self.is_running():
             self.release_process_handle()
