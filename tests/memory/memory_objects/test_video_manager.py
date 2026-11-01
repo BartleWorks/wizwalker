@@ -7,24 +7,22 @@ import pymem.process
 import pytest
 import regex
 
-from wizwalker import PatternFailed, PatternMultipleResults, VideoManagerError
-from wizwalker.memory.memory_objects.video_manager import (
-    _FRAME_PATTERN,
-    _SLOT_PATTERN,
-    _VTABLE_ENTRIES,
-    VideoManager,
-)
+from wizwalker import MemoryReadError, PatternFailed, PatternMultipleResults, VideoManagerError
+from wizwalker.memory.memory_objects.video_manager import _FRAME_PATTERN, _SLOT_PATTERN, VideoManager
 from wizwalker.memory.memory_reader import MemoryReader
 
 MODULE = 0x1_4000_0000
 CODE = MODULE + 0x1000
 SLOT = MODULE + 0x2000
-VTABLE = MODULE + 0x3000
 MANAGER = 0x2_0000_0000
+DEVICE = 0x2_8000_0000
 NODE = 0x3_0000_0000
 STRING = 0x3_0000_1000
 
 PENDING = 0x2AB01
+DEVICE_FIELD = 0x2AC10
+WIDTH_FIELD = 0x24
+HEIGHT_FIELD = 0x28
 SLOT_AT = 0x20
 FRAME_AT = 0x100
 
@@ -40,8 +38,8 @@ def slot_store(at: int, slot: int = SLOT) -> bytes:
     )
 
 
-def frame_function(tested: int = PENDING, cleared: int = PENDING) -> bytes:
-    """The frame function's opening, with the sites it tests and clears the byte at."""
+def frame_function(tested: int = PENDING, cleared: int = PENDING, device: int = DEVICE_FIELD) -> bytes:
+    """The frame function: its opening, and the sites that say where each field is."""
     code = bytearray(0x1A8)
     opening = (
         b"\x48\x8B\xC4\x48\x89\x58\x10\x48\x89\x70\x18\x55\x57\x41\x56"
@@ -51,13 +49,15 @@ def frame_function(tested: int = PENDING, cleared: int = PENDING) -> bytes:
     )
     code[: len(opening)] = opening
     code[0x3D:0x44] = b"\x80\xB9" + struct.pack("<I", tested) + b"\x00"
+    code[0x4A:0x51] = b"\x48\x8B\x89" + struct.pack("<I", device)
+    code[0x150:0x157] = bytes([0x8B, 0x70, WIDTH_FIELD, 0x44, 0x8B, 0x70, HEIGHT_FIELD])
     code[0x1A0:0x1A7] = b"\xC6\x83" + struct.pack("<I", cleared) + b"\x00"
     return bytes(code)
 
 
 @pytest.fixture
 def game(process, monkeypatch):
-    """A module with both sites, the slot holding a manager whose vtable names the frame function."""
+    """A module with both sites, and the slot holding a manager with a device 1280x720."""
 
     def scan(self, handle, module, pattern):
         code = process.read_bytes(CODE, 0x1000)
@@ -73,10 +73,10 @@ def game(process, monkeypatch):
     process.map(CODE, bytes(code))
 
     process.map(SLOT, struct.pack("<Q", MANAGER))
-    vtable = [0] * _VTABLE_ENTRIES
-    vtable[90] = CODE + FRAME_AT
-    process.map(VTABLE, struct.pack(f"<{_VTABLE_ENTRIES}Q", *vtable))
-    process.map(MANAGER, struct.pack("<Q", VTABLE), size=PENDING + 0x10)
+    process.map(MANAGER, size=DEVICE_FIELD + 0x10)
+    process.put(MANAGER + DEVICE_FIELD, "Q", DEVICE)
+    process.map(DEVICE, size=0x40)
+    process.put(DEVICE + WIDTH_FIELD, "II", 1280, 720)
 
     process.map(NODE, size=0x60)
     process.put(NODE + 0x18, "Q", STRING)
@@ -126,8 +126,8 @@ async def test_the_manager_comes_from_the_slot_the_constructor_stores_to(manager
     assert await manager.read_base_address() == MANAGER
 
 
-async def test_a_slot_at_either_side_of_the_code_is_found(game, manager):
-    # The displacement is signed, and a slot before the code is as good as one after it
+async def test_a_slot_before_the_code_is_found_too(game, manager):
+    # The displacement is signed
     below = MODULE + 0x800
     game.map(below, struct.pack("<Q", MANAGER))
     replace_code(game, SLOT_AT, slot_store(CODE + SLOT_AT, below))
@@ -140,24 +140,39 @@ async def test_an_empty_slot_raises(game, manager):
         await manager.read_base_address()
 
 
-async def test_a_vtable_without_the_frame_function_raises(game, manager):
-    game.put(VTABLE + 90 * 8, "Q", 0x1234)
-    with pytest.raises(VideoManagerError, match="vtable"):
+async def test_an_object_with_no_device_raises(game, manager):
+    game.put(MANAGER + DEVICE_FIELD, "Q", 0)
+    with pytest.raises(VideoManagerError, match="no device"):
         await manager.read_base_address()
 
 
-async def test_the_frame_function_is_found_at_any_entry(game, manager):
-    game.put(VTABLE + 90 * 8, "Q", 0)
-    game.put(VTABLE + 89 * 8, "Q", CODE + FRAME_AT)
+async def test_an_object_whose_device_cannot_be_read_raises(game, manager):
+    game.put(MANAGER + DEVICE_FIELD, "Q", 0x7777_0000)
+    with pytest.raises(MemoryReadError):
+        await manager.read_base_address()
+
+
+@pytest.mark.parametrize(
+    "size",
+    [(0, 0), (1280, 0), (99, 720), (1280, 99), (16385, 720), (1280, 16385), (0xFFFFFFFF, 0x40000000)],
+)
+async def test_a_device_of_no_real_size_raises(game, manager, size):
+    game.put(DEVICE + WIDTH_FIELD, "II", *size)
+    with pytest.raises(VideoManagerError, match="size"):
+        await manager.read_base_address()
+
+
+@pytest.mark.parametrize("size", [(534, 300), (100, 100), (16384, 16384)])
+async def test_a_device_of_any_real_size_is_accepted(game, manager, size):
+    game.put(DEVICE + WIDTH_FIELD, "II", *size)
     assert await manager.read_base_address() == MANAGER
 
 
 async def test_a_new_object_in_the_slot_is_checked_again(game, manager):
     await manager.read_base_address()
-    game.map(0x2_8000_0000, struct.pack("<Q", 0x2_8000_1000))
-    game.map(0x2_8000_1000, size=_VTABLE_ENTRIES * 8)
-    game.put(SLOT, "Q", 0x2_8000_0000)
-    with pytest.raises(VideoManagerError, match="vtable"):
+    game.map(0x2_4000_0000, size=DEVICE_FIELD + 0x10)
+    game.put(SLOT, "Q", 0x2_4000_0000)
+    with pytest.raises(VideoManagerError, match="no device"):
         await manager.read_base_address()
 
 
@@ -181,7 +196,7 @@ async def test_each_pattern_is_scanned_once(manager, monkeypatch):
     assert sorted(scans) == sorted([_SLOT_PATTERN, _FRAME_PATTERN])
 
 
-# --- the pending byte's offset -----------------------------------------------
+# --- what the code says ------------------------------------------------------
 
 
 @pytest.mark.parametrize("offset", [0x2AB01, 0x3CD07])
@@ -192,7 +207,7 @@ async def test_the_offset_comes_from_the_code(game, manager, offset):
 
 async def test_sites_that_disagree_raise(game, manager):
     replace_code(game, FRAME_AT, frame_function(0x2AB01, 0x2AB09))
-    with pytest.raises(VideoManagerError, match="tested at 0x2ab01 and cleared at 0x2ab09"):
+    with pytest.raises(VideoManagerError, match="tested at .* and cleared at"):
         await manager.pending_flag_offset()
 
 
@@ -201,6 +216,9 @@ async def test_sites_that_disagree_raise(game, manager):
     [
         (0x3D, b"\x80\xBA\x01\xAB\x02\x00\x00"),  # another register
         (0x3D, b"\x80\xB9\x01\xAB\x02\x00\x01"),  # another value
+        (0x4A, b"\x48\x8B\x8B\x10\xAC\x02\x00"),  # another register
+        (0x150, b"\x8B\x78\x24\x44\x8B\x70\x28"),  # another register
+        (0x150, b"\x8B\x70\x24\x44\x8B\x78\x28"),  # another register for the height
         (0x1A0, b"\xC6\x87\x01\xAB\x02\x00\x00"),  # another register
         (0x1A0, b"\xC6\x83\x01\xAB\x02\x00\x01"),  # a set, not a clear
     ],
@@ -209,6 +227,12 @@ async def test_code_that_is_not_the_expected_instruction_raises(game, manager, s
     replace_code(game, FRAME_AT + site, found)
     with pytest.raises(VideoManagerError, match="Expected"):
         await manager.pending_flag_offset()
+
+
+async def test_the_device_size_comes_from_where_the_code_reads_it(game, manager):
+    assert await manager.read_device_size() == (1280, 720)
+    game.put(DEVICE + WIDTH_FIELD, "II", 534, 300)
+    assert await manager.read_device_size() == (534, 300)
 
 
 # --- asking for a size -------------------------------------------------------
@@ -253,7 +277,7 @@ async def test_a_node_with_no_string_writes_nothing(game, manager):
     "break_it",
     [
         lambda game: game.put(SLOT, "Q", 0),
-        lambda game: game.put(VTABLE + 90 * 8, "Q", 0),
+        lambda game: game.put(DEVICE + WIDTH_FIELD, "II", 0, 0),
         lambda game: replace_code(game, FRAME_AT + 0x1A0, b"\xC6\x83\x09\xAB\x02\x00\x00"),
     ],
 )
