@@ -43,6 +43,7 @@ from .social_systems_manager import (
     CurrentSocialSystemsManager,
     DynamicSocialSystemsManager,
 )
+from .video_manager import VideoManager
 from .adventure_party_list import AdventurePartyList, DynamicAdventurePartyList
 from .adventure_party_info import AdventurePartyInfo, DynamicAdventurePartyInfo
 from .adventure_party_entry_info import (

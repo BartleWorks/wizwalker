@@ -31,6 +31,7 @@ from .memory import (
     TeleportHelper,
     MovementTeleportHook,
     DropsToggleHook,
+    VideoManager,
 )
 from .memory.memory_objects.character_registry import DynamicCharacterRegistry
 from .memory.memory_objects.quest_client_manager import QuestClientManager
@@ -79,6 +80,7 @@ class Client:
         self.game_client = CurrentGameClient(self.hook_handler)
         self.social_systems_manager = CurrentSocialSystemsManager(self.hook_handler)
         self.chat_owner = CurrentChatOwner(self.hook_handler)
+        self.video_manager = VideoManager(self.hook_handler)
 
         self._teleport_helper = TeleportHelper(self.hook_handler)
 

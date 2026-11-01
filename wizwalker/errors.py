@@ -104,6 +104,13 @@ class MemoryWriteError(WizWalkerMemoryError):
         super().__init__(f"Unable to write memory at address {address}.")
 
 
+class VideoManagerError(WizWalkerMemoryError):
+    """
+    Raised when the video manager, or the code that says where its fields are, is not
+    what a resize expects, so nothing should be written
+    """
+
+
 class ReadingEnumFailed(WizWalkerMemoryError):
     """
     Raised when the value passed to an enum is not valid
