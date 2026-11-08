@@ -3,12 +3,27 @@ import regex
 from contextlib import suppress
 
 from wizwalker.memory.memory_objects.enums import WindowFlags
+from wizwalker.memory.memory_objects.window import window_at_path
 from wizwalker.utils import maybe_wait_for_value_with_timeout, poll_until
 
 
 #: How long a click in the friends list is given to show: a page turned, the
 #: list opened, a friend's profile up. Each was a fixed wait or none at all.
 FRIENDS_LIST_TIMEOUT = 1.0
+
+# The HUD's windows by their paths from the root of the UI. A search of the whole UI by
+# name took about 30 ms a time, and the profile popup's was polled.
+
+#: The compact friends list. F cycles closed, this, the larger `wndFriendsList`, closed.
+FRIENDS_LIST_PATH = ("WorldView", "windowHUD", "NewFriendsListWindow")
+FRIENDS_BUTTON_PATH = ("WorldView", "windowHUD", "windowForTopRowButtons", "btnFriends")
+#: A friend's profile popup. It stays in the tree when closed.
+CHARACTER_WINDOW_PATH = ("WorldView", "windowHUD", "wndCharacter")
+#: The game's ordinary modal box, at the root, which asks whether to teleport to a friend.
+#: Others share its name: the flee confirmation's is in the planning phase, the deck
+#: page's under WorldView.
+MESSAGE_BOX_PATH = ("MessageBoxModalWindow",)
+MESSAGE_BOX_YES_PATH = (*MESSAGE_BOX_PATH, "messageBoxBG", "messageBoxLayout", "AdjustmentWindow", "Layout", "centerButton")
 
 
 _friend_list_entry = regex.compile(
@@ -63,6 +78,19 @@ async def _maybe_get_named_window(parent, name: str, retries: int = 4):
         raise ValueError(f"Multiple results for {name}")
 
     return possible[0]
+
+
+async def _maybe_get_window_at_path(parent, path, retries: int = 4):
+    """The window at `path` under `parent`, retried as `_maybe_get_named_window` retries a name.
+
+    Raises ValueError when it is not there after the last try.
+    """
+    while (window := await window_at_path(parent, path)) is None:
+        if retries <= 0:
+            raise ValueError(f"No window at {'/'.join(path)}")
+        retries -= 1
+        await asyncio.sleep(0.4)
+    return window
 
 
 async def _cycle_to_online_friends(client, friends_list):
@@ -212,8 +240,7 @@ async def _click_on_friend(client, friends_list, friend_index):
 
 
 async def _find_character_window(client):
-    windows = await client.root_window.get_windows_with_name("wndCharacter")
-    return windows[0] if len(windows) == 1 else None
+    return await window_at_path(client.root_window, CHARACTER_WINDOW_PATH)
 
 
 async def _character_window_state(popup):
@@ -226,41 +253,48 @@ async def _character_window_state(popup):
     return await labels[0].maybe_text() if len(labels) == 1 else ""
 
 
-async def _message_box_caption(client):
+async def _message_box_caption(client, box_path=None):
     """The caption of the modal message box, or None while none is up.
+
+    The box at `box_path`, from the root of the UI, or else the one window in the whole UI
+    named `MessageBoxModalWindow`, if there is only one. Several boxes live in different
+    places, so a caller that knows which one it is waiting for passes its path.
 
     The window tree keeps the box's windows around after it closes, so the window existing
     says nothing; its caption only holds text while a dialog is showing.
     """
-    boxes = await client.root_window.get_windows_with_name("MessageBoxModalWindow")
-    if len(boxes) != 1:
-        return None
+    if box_path is not None:
+        box = await window_at_path(client.root_window, box_path)
+        if box is None:
+            return None
+    else:
+        boxes = await client.root_window.get_windows_with_name("MessageBoxModalWindow")
+        if len(boxes) != 1:
+            return None
+        box = boxes[0]
 
-    captions = await boxes[0].get_windows_with_name("CaptionText")
+    captions = await box.get_windows_with_name("CaptionText")
     if len(captions) != 1:
         return None
 
     return await captions[0].maybe_text()
 
 
-async def _wait_for_message_box(client, timeout: float = 3.0, interval: float = 0.05):
+async def _wait_for_message_box(client, timeout: float = 3.0, interval: float = 0.05, *, box_path=None):
     """Wait for a modal message box to appear, returning as soon as it does.
 
     Gives up quietly after *timeout*, leaving the caller's own lookup to report a box
-    that never came.
+    that never came. See `_message_box_caption` for `box_path`.
     """
-    await poll_until(lambda: _message_box_caption(client), timeout=timeout, interval=interval)
+    await poll_until(lambda: _message_box_caption(client, box_path), timeout=timeout, interval=interval)
 
 
 async def _teleport_to_friend(client, character_window):
     teleport_button = await _maybe_get_named_window(character_window, "btnGoToFriend")
     await client.mouse_handler.click_window(teleport_button)
-    await _wait_for_message_box(client)
+    await _wait_for_message_box(client, box_path=MESSAGE_BOX_PATH)
 
-    confirmation_window = await _maybe_get_named_window(
-        client.root_window, "MessageBoxModalWindow"
-    )
-    yes_button = await _maybe_get_named_window(confirmation_window, "centerButton")
+    yes_button = await _maybe_get_window_at_path(client.root_window, MESSAGE_BOX_YES_PATH)
 
     close_button = await _maybe_get_named_window(character_window, "btnCharacterClose")
 
@@ -294,21 +328,17 @@ async def teleport_to_friend_from_list(
         raise ValueError("Must specify icon_list and icon_index or name or all")
 
     try:
-        friends_window = await _maybe_get_named_window(
-            client.root_window, "NewFriendsListWindow"
-        )
+        friends_window = await _maybe_get_window_at_path(client.root_window, FRIENDS_LIST_PATH)
     except ValueError:
         # friend's list isn't open so open it
-        friend_button = await _maybe_get_named_window(client.root_window, "btnFriends")
+        friend_button = await _maybe_get_window_at_path(client.root_window, FRIENDS_BUTTON_PATH)
         await client.mouse_handler.click_window(friend_button)
 
-        friends_window = await _maybe_get_named_window(
-            client.root_window, "NewFriendsListWindow"
-        )
+        friends_window = await _maybe_get_window_at_path(client.root_window, FRIENDS_LIST_PATH)
     else:
         if not await friends_window.is_visible():
             # friend's list isn't open so open it
-            friend_button = await _maybe_get_named_window(client.root_window, "btnFriends")
+            friend_button = await _maybe_get_window_at_path(client.root_window, FRIENDS_BUTTON_PATH)
             await client.mouse_handler.click_window(friend_button)
             # It was read straight after the click, before it had opened
             await poll_until(friends_window.is_visible, timeout=FRIENDS_LIST_TIMEOUT)
@@ -344,7 +374,7 @@ async def teleport_to_friend_from_list(
 
     await _click_on_friend(client, friends_list_window, friend_index)
 
-    character_window = await _maybe_get_named_window(client.root_window, "wndCharacter")
+    character_window = await _maybe_get_window_at_path(client.root_window, CHARACTER_WINDOW_PATH)
     await _teleport_to_friend(client, character_window)
 
     # close friends window

@@ -19,16 +19,27 @@ class Spellbook:
         self.opens = opens
         self.actions = []
         self.mouse_handler = self
-        self.root_window = Window("root", children=[Window("btnSpellbook")])
-        self.box = self.root_window.add(Window("MessageBoxModalWindow", visible=False, children=[
-            Window("CaptionText"), Window("leftButton"),
+        self.root_window = Window("root", children=[
+            # Another box ahead of the deck's, which a search by name would find first
+            Window("MessageBoxModalWindow", visible=False, children=[Window("CaptionText"), Window("centerButton")]),
+        ])
+        self.world_view = self.root_window.add(Window("WorldView", children=[
+            Window("windowHUD", children=[Window("btnSpellbook")]),
+        ]))
+        self.box = self.world_view.add(Window("MessageBoxModalWindow", visible=False, children=[
+            Window("messageBoxBG", children=[Window("messageBoxLayout", children=[
+                Window("TextArea", children=[Window("CaptionText")]),
+                Window("AdjustmentWindow", children=[Window("Layout", children=[
+                    Window("leftButton"), Window("centerButton"), Window("rightButton"),
+                ])]),
+            ])]),
         ]))
         self.page = None
         if page_open:
             self._open()
 
     def _open(self):
-        self.page = self.root_window.add(Window("DeckConfiguration", children=[
+        self.page = self.world_view.add(Window("DeckConfiguration", children=[
             Window("Deck"), Window("Cards_All"), Window("TreasureCardButton"), Window("ClearDeckButton"),
         ]))
 
@@ -37,7 +48,7 @@ class Spellbook:
             if self.opens:
                 self._open()
         else:
-            self.root_window.remove(self.page)
+            self.world_view.remove(self.page)
             self.page = None
 
     # --- the client ------------------------------------------------------
@@ -64,8 +75,9 @@ class Spellbook:
                 self.box.find("CaptionText").text = "Clear your deck?"
 
             asyncio.get_running_loop().call_later(OPEN_DELAY, ask)
-        elif name == "leftButton":
-            self.actions[-1] = "leftButton (box up)" if self.box.visible else "leftButton (no box)"
+        elif name in ("leftButton", "centerButton", "rightButton"):
+            whose = "the deck's box" if window in self.box.find("Layout")._children else "another box"
+            self.actions[-1] = f"{name} of {whose} ({'up' if self.box.visible else 'not up'})"
             self.box.visible = False
             self.box.find("CaptionText").text = None
 
@@ -142,7 +154,20 @@ async def test_clearing_answers_the_box_once_it_is_up():
     builder = DeckBuilder(book)
     await builder.open_deck_page()
     await builder.clear_deck()
-    assert book.actions[-2:] == ["ClearDeckButton", "leftButton (box up)"]
+    assert book.actions[-2:] == ["ClearDeckButton", "centerButton of the deck's box (up)"]
+
+
+async def test_the_deck_page_and_the_spellbook_button_are_found_by_their_paths():
+    book = Spellbook()
+    book.root_window.add(Window("DeckConfiguration"))  # a search by name finds this one first
+    book.root_window.forbid_searches()
+    builder = DeckBuilder(book)
+    await builder.open_deck_page()
+    assert builder._deck_config_window is book.page
+    await builder.clear_deck()
+    assert book.actions[-1] == "centerButton of the deck's box (up)"
+    await builder.close_deck_page()
+    assert book.page is None
 
 
 async def test_clearing_treasure_cards_that_never_clear_gives_up(monkeypatch):

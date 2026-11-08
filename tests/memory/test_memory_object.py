@@ -58,6 +58,44 @@ async def test_a_length_out_of_bounds_reads_empty(obj, process, length):
     assert await obj.read_string(BASE) == ""
 
 
+def _long_wide_string(process, text: str) -> None:
+    process.write_bytes(BASE, pack_string(text, wide=True, heap=0x80000, process=process), 32)
+
+
+async def test_a_wide_string_past_max_string_reads_with_a_raised_bound(obj, process):
+    text = "x" * (MAX_STRING + 1)
+    _long_wide_string(process, text)
+    assert await obj.read_wide_string(BASE) == ""
+    assert await obj.read_wide_string(BASE, max_len=MAX_STRING * 10) == text
+
+
+async def test_a_wide_tail_reads_only_the_end_and_says_it_was_cut(obj, process):
+    text = "".join(f"line {i}\n" for i in range(2000))  # past MAX_STRING
+    _long_wide_string(process, text)
+    assert await obj.read_wide_string_tail(BASE, 100, max_len=len(text)) == (text[-100:], True)
+
+
+async def test_a_wide_tail_longer_than_the_string_reads_all_of_it(obj, process):
+    _long_wide_string(process, "Unicorn Way")
+    assert await obj.read_wide_string_tail(BASE, 100) == ("Unicorn Way", False)
+
+
+async def test_a_short_inline_string_reads_whole_as_a_tail(obj, process):
+    process.write_bytes(BASE, pack_string("Ice", wide=True), 32)
+    assert await obj.read_wide_string_tail(BASE, 100) == ("Ice", False)
+
+
+async def test_a_wide_tail_still_refuses_a_length_past_its_bound(obj, process):
+    _long_wide_string(process, "x" * (MAX_STRING + 1))
+    assert await obj.read_wide_string_tail(BASE, 100) == ("", False)
+
+
+async def test_a_wide_tail_cut_inside_a_surrogate_pair_drops_its_second_half(obj, process):
+    # "🐉" is two UTF-16 code units, so a 3-unit tail starts on the low half.
+    _long_wide_string(process, "Dragon 🐉ab")
+    assert await obj.read_wide_string_tail(BASE, 3) == ("ab", True)
+
+
 async def test_an_inline_string_longer_than_its_buffer_reads_empty(obj, process):
     process.put(BASE + 16, "QQ", 20, 15)
     assert await obj.read_string(BASE) == ""

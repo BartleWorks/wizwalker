@@ -5,6 +5,7 @@ import ctypes.wintypes
 import wizwalker
 from wizwalker import user32
 from wizwalker.memory.hooks import MouselessCursorMoveHook
+from wizwalker.window_messages import send_message
 
 
 class MouseHandler:
@@ -154,15 +155,17 @@ class MouseHandler:
             # TODO: test passing use_post
             await self.set_mouse_position(x, y)
             await asyncio.sleep(self.click_predelay)
-            # mouse button down
-            send_method(self.client.window_handle, button_down_message, 1, 0)
             try:
+                # mouse button down
+                await send_message(send_method, self.client.window_handle, button_down_message, 1, 0)
                 if sleep_duration > 0:
                     await asyncio.sleep(sleep_duration)
             finally:
-                # mouse button up, even when cancelled while held: the game would
-                # otherwise go on believing the button is down
-                send_method(self.client.window_handle, button_down_message + 1, 0, 0)
+                # mouse button up, even when cancelled while held, or while the down was
+                # still being delivered: the game would otherwise go on believing the
+                # button is down. A cancel ends the wait, not the send, so the down
+                # still arrives first
+                await send_message(send_method, self.client.window_handle, button_down_message + 1, 0, 0)
             # move mouse outside of client area
             await self.set_mouse_position(-100, -100)
 
@@ -207,5 +210,5 @@ class MouseHandler:
         res = await self.client.hook_handler.write_mouse_position(x, y)
         # position doesn't matter here; sending mouse move
         # mouse move is here so that items are highlighted
-        send_method(self.client.window_handle, 0x200, 0, 0)
+        await send_message(send_method, self.client.window_handle, 0x200, 0, 0)
         return res

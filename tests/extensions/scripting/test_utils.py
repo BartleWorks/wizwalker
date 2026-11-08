@@ -20,6 +20,18 @@ def entry(name: str, row: int, icon: int = 3, icon_list: int = 1) -> str:
     )
 
 
+def message_box() -> Window:
+    """A modal message box, hidden, laid out as the game's."""
+    return Window("MessageBoxModalWindow", visible=False, children=[
+        Window("messageBoxBG", children=[Window("messageBoxLayout", children=[
+            Window("TextArea", children=[Window("CaptionText")]),
+            Window("AdjustmentWindow", children=[Window("Layout", children=[
+                Window("leftButton"), Window("centerButton"), Window("rightButton"),
+            ])]),
+        ])]),
+    ])
+
+
 class RenderContext:
     async def ui_scale(self):
         return 1.0
@@ -38,7 +50,7 @@ class FriendsGame:
         self.mouse_handler = self
 
         self.root_window = Window("root")
-        hud = self.root_window.add(Window("windowHUD"))
+        hud = self.root_window.add(Window("WorldView")).add(Window("windowHUD"))
         self.friends_window = hud.add(Window("NewFriendsListWindow", visible=list_open))
         self.friends_window.add(Window("lblFriendsList", text="<center>Online Friends</center>"))
         self.friends_window.add(Window("btnListTypeRight"))
@@ -52,13 +64,14 @@ class FriendsGame:
         self.friends_window.add(Window("btnArrowUp"))
         self.page_number = self.friends_window.add(Window("PageNumber"))
         self._show_page()
-        hud.add(Window("btnFriends"))
+        hud.add(Window("windowForTopRowButtons", children=[Window("btnFriends")]))
         self.profile = hud.add(Window("wndCharacter", visible=False, children=[
             Window("lblCharacterName"), Window("btnGoToFriend"), Window("btnCharacterClose"),
         ]))
-        self.box = self.root_window.add(Window("MessageBoxModalWindow", visible=False, children=[
-            Window("CaptionText"), Window("centerButton"),
-        ]))
+        self.box = self.root_window.add(message_box())
+        self.yes = self.box.find("centerButton")
+        # Another box, as the deck page's: a search by name finds two
+        self.root_window.find("WorldView").add(message_box())
 
     def _show_page(self):
         self.page_number.text = f"<center>{self.page} / {self.pages}</center>"
@@ -81,7 +94,7 @@ class FriendsGame:
         elif name == "btnGoToFriend":
             self.box.visible = True
             self.box.find("CaptionText").text = "Teleport to your friend?"
-        elif name == "centerButton" and self.box.visible:
+        elif window is self.yes and self.box.visible:
             self.ported_to = self.profile.find("lblCharacterName").text
             self.box.visible = False
             self.box.find("CaptionText").text = None
@@ -219,11 +232,48 @@ async def test_the_message_box_wait_ends_when_a_caption_shows():
     game = FriendsGame()
     game.box.visible = True
     game.box.find("CaptionText").text = "Teleport?"
-    await asyncio.wait_for(utils._wait_for_message_box(game, timeout=5), 1)
+    await asyncio.wait_for(utils._wait_for_message_box(game, timeout=5, box_path=utils.MESSAGE_BOX_PATH), 1)
 
 
 async def test_the_message_box_wait_gives_up_quietly():
     await utils._wait_for_message_box(FriendsGame(), timeout=0.05)
+
+
+async def test_a_message_box_named_by_its_path_is_read_beside_another():
+    # Two boxes: a search of the whole UI by name could not tell which to read
+    game = FriendsGame()
+    other = game.root_window.find("WorldView").add(Window("Other", children=[
+        Window("MessageBoxModalWindow", children=[Window("CaptionText", text="Leave the dungeon?")]),
+    ]))
+    assert await utils._message_box_caption(game) is None
+    assert await utils._message_box_caption(game, ("WorldView", "Other", "MessageBoxModalWindow")) == "Leave the dungeon?"
+    assert await utils._message_box_caption(game, ("WorldView", "Missing")) is None
+    other.find("CaptionText").text = None
+    await utils._wait_for_message_box(game, timeout=0.05, box_path=("WorldView", "Other", "MessageBoxModalWindow"))
+
+
+async def test_the_hud_is_read_by_its_paths():
+    game = FriendsGame(list_open=False)
+    root = game.root_window
+    # Windows a search by name finds first
+    root.add(Window("wndCharacter"))
+    root.add(Window("btnFriends"))
+    root.forbid_searches()
+    await asyncio.wait_for(utils.teleport_to_friend_from_list(game, name="Friend 7"), 10)
+    assert game.ported_to == "Friend 7"
+    assert game.clicks[0] == "btnFriends"
+
+
+async def test_a_window_at_a_path_is_retried_then_refused(monkeypatch):
+    sleeps = []
+
+    async def no_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(utils.asyncio, "sleep", no_sleep)
+    with pytest.raises(ValueError):
+        await utils._maybe_get_window_at_path(Window("root"), ("A", "Missing"), retries=2)
+    assert sleeps == [0.4, 0.4]
 
 
 async def test_a_named_window_is_retried_then_refused(monkeypatch):

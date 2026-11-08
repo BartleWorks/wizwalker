@@ -1,15 +1,16 @@
 import asyncio
 
 from wizwalker.combat.card import CombatCard
+from wizwalker.combat.handler import CombatHandler
 
-from .fakes import Client, Window
+from .fakes import Client, Window, planning_phase
 
 
-class Hand:
+class Hand(CombatHandler):
     """A combat handler holding `size` cards, one fewer once `shrink_on` is clicked."""
 
     def __init__(self, size: int, *, shrink_on=None, root: Window = None):
-        self.client = Client(root)
+        super().__init__(Client(root))
         self.size = size
         self.reads = 0
         if shrink_on is not None:
@@ -77,13 +78,33 @@ async def test_a_card_cast_at_a_member_clicks_its_health():
 
 async def test_a_multi_target_card_clicks_each_target_and_confirms():
     confirm = Window("ConfirmTargetsConfirm")
-    root = Window("root", children=[Window("ConfirmTargetsWindow", children=[confirm])])
+    root = planning_phase(
+        sub_window=[Window("ConfirmTargetsWindow", children=[confirm])],
+        # a hidden one ahead of it, which a search by name finds first
+        decoys=[Window("ConfirmTargetsWindow", visible=False, children=[Window("ConfirmTargetsConfirm")])],
+    ).forbid_searches()
     card, first, second = Window("card"), Window("Health"), Window("Health")
     hand = Hand(3, root=root)
     await CombatCard(hand, card).cast([Member(first), Member(second)], sleep_time=0.01)
     assert hand.client.mouse_handler.actions == [
         ("click", card), ("click", first), ("click", second), ("click", confirm)
     ]
+
+
+async def test_a_multi_target_card_the_path_does_not_describe_is_confirmed_by_name():
+    confirm = Window("ConfirmTargetsConfirm")
+    root = Window("root", children=[Window("ConfirmTargetsWindow", children=[confirm])])
+    card, target = Window("card"), Window("Health")
+    hand = Hand(3, root=root)
+    await CombatCard(hand, card).cast([Member(target)], sleep_time=0.01)
+    assert hand.client.mouse_handler.actions[-1] == ("click", confirm)
+
+
+async def test_a_multi_target_card_needs_no_confirmation_while_none_is_asked():
+    card, target = Window("card"), Window("Health")
+    hand = Hand(3, root=planning_phase())
+    await CombatCard(hand, card).cast([Member(target)], sleep_time=0.01)
+    assert hand.client.mouse_handler.actions == [("click", card), ("click", target)]
 
 
 async def test_discarding_is_a_right_click_and_waits_for_the_hand():

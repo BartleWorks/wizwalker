@@ -18,6 +18,7 @@ import appdirs
 
 from wizwalker import ExceptionalTimeout
 from wizwalker.constants import Keycode, kernel32, user32, gdi32, WM_KEYDOWN, WM_KEYUP
+from wizwalker.window_messages import send_message
 
 
 DEFAULT_INSTALL = "C:/ProgramData/KingsIsle Entertainment/Wizard101"
@@ -880,21 +881,21 @@ async def send_hotkey(window_handle: int, modifers: List[Keycode], key: Keycode)
         key: The key to press
     """
     for modifier in modifers:
-        _send_keydown(window_handle, modifier)
+        await _send_keydown(window_handle, modifier)
 
-    _send_keydown(window_handle, key)
-    _send_keyup(window_handle, key)
+    await _send_keydown(window_handle, key)
+    await _send_keyup(window_handle, key)
 
     for modifier in modifers:
-        _send_keyup(window_handle, modifier)
+        await _send_keyup(window_handle, modifier)
 
 
-def _send_keydown(window_handle: int, key: Keycode):
-    user32.SendMessageW(window_handle, WM_KEYDOWN, key.value, 0)
+async def _send_keydown(window_handle: int, key: Keycode):
+    await send_message(user32.SendMessageW, window_handle, WM_KEYDOWN, key.value, 0)
 
 
-def _send_keyup(window_handle: int, key: Keycode):
-    user32.SendMessageW(window_handle, WM_KEYUP, key.value, 0)
+async def _send_keyup(window_handle: int, key: Keycode):
+    await send_message(user32.SendMessageW, window_handle, WM_KEYUP, key.value, 0)
 
 
 async def timed_send_key(window_handle: int, key: Keycode, seconds: float):
@@ -913,12 +914,12 @@ async def timed_send_key(window_handle: int, key: Keycode, seconds: float):
         keydown_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await keydown_task
-        _send_keyup(window_handle, key)
+        await _send_keyup(window_handle, key)
 
 
 async def _send_keydown_forever(window_handle: int, key: Keycode):
     while True:
-        _send_keydown(window_handle, key)
+        await _send_keydown(window_handle, key)
         await asyncio.sleep(0.05)
 
 # TODO: Can replace this with more generic one if needed, but only here for camera maths

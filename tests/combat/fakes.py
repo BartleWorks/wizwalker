@@ -5,6 +5,34 @@ from wizwalker.memory.memory_objects.enums import DuelPhase
 from ..fake_windows import Window
 
 
+def planning_phase(
+    *, combatants=(), hand=(), action_buttons=(), sub_window=(), decoys=()
+) -> Window:
+    """A root holding the planning phase's windows where the game puts them.
+
+    `decoys` go ahead of them all, at the root: windows sharing a name with one of
+    them, which a search of the whole UI by name would find first.
+    """
+    return Window("root", children=[
+        *decoys,
+        Window("WorldView", children=[
+            Window("PlanningPhase", children=[
+                Window(""),  # unnamed, like the combatants' window, but holding none
+                Window("", children=combatants),
+                Window("Alignment", children=[
+                    Window("PlanningPhaseSubWindow", children=[
+                        *sub_window,
+                        Window("SpellSelection", children=[
+                            Window("Hand", children=hand),
+                            Window("ActionButtons", children=action_buttons),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]),
+    ])
+
+
 class Mouse:
     """Records every click; `on_click` lets a test make the game answer one."""
 

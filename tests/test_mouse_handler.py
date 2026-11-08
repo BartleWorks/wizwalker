@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -94,6 +95,26 @@ async def test_a_held_click_cut_short_still_lets_go(mouse, user32):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert user32.messages[-1] == LBUTTONUP
+
+
+async def test_a_click_cut_short_while_the_game_is_not_answering_still_lets_go_after_the_press(mouse, user32):
+    answering = threading.Event()
+    answer = user32.SendMessageW
+
+    def slow_down(handle, message, wparam, lparam):
+        if message == LBUTTONDOWN:
+            answering.wait(5)
+        answer(handle, message, wparam, lparam)
+
+    user32.SendMessageW = slow_down
+    task = asyncio.create_task(mouse.click(1, 1))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    answering.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)  # the release, handed over after the cancel, arrives
+    assert user32.messages[-2:] == [LBUTTONDOWN, LBUTTONUP]
 
 
 async def test_clicks_do_not_overlap(mouse, user32):

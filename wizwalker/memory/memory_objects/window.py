@@ -1,10 +1,11 @@
 import struct
-from typing import Callable, List, Optional
-from contextlib import suppress
+from typing import AsyncIterator, Callable, List, Optional, Sequence
+from contextlib import aclosing, suppress
 
 from loguru import logger
 
 from wizwalker.memory.memory_object import (
+    MAX_STRING,
     Primitive,
     DynamicMemoryObject,
     PropertyClass,
@@ -12,7 +13,44 @@ from wizwalker.memory.memory_object import (
 from .enums import WindowFlags, WindowStyle
 from .spell import DynamicGraphicalSpell
 from .combat_participant import DynamicCombatParticipant
-from wizwalker import AddressOutOfRange, MemoryReadError, Rectangle, utils
+from wizwalker import AddressOutOfRange, MemoryReadError, Rectangle, WizWalkerMemoryError, utils
+
+
+async def iter_windows_at_path(parent, path: Sequence[str]) -> AsyncIterator["Window"]:
+    """Every window at `path` under `parent`, matched by name one level at a time, in tree order.
+
+    Depth-first, backing out of a branch that does not complete the path, since siblings
+    can share a name. A few dozen reads, where a search of the whole UI by name is
+    thousands. A window that cannot be read is a branch that does not complete it.
+    """
+    if not path:
+        yield parent
+        return
+    try:
+        children = await parent.children()
+    except (ValueError, WizWalkerMemoryError):
+        return
+    for child in children:
+        try:
+            matches = await child.name() == path[0]
+        except (ValueError, WizWalkerMemoryError):
+            continue
+        if matches:
+            async for window in iter_windows_at_path(child, path[1:]):
+                yield window
+
+
+async def window_at_path(parent, path: Sequence[str]) -> Optional["Window"]:
+    """The first window at `path` under `parent`, or None. See `iter_windows_at_path`."""
+    async with aclosing(iter_windows_at_path(parent, path)) as windows:
+        async for window in windows:
+            return window
+    return None
+
+
+async def windows_at_path(parent, path: Sequence[str]) -> List["Window"]:
+    """Every window at `path` under `parent`. See `iter_windows_at_path`."""
+    return [window async for window in iter_windows_at_path(parent, path)]
 
 
 # TODO: Window.click
@@ -166,8 +204,7 @@ class Window(PropertyClass):
 
         return DynamicCombatParticipant(self.hook_handler, addr)
 
-    # See maybe_graphical_spell
-    async def maybe_text(self, *, check_type: bool = False) -> str:
+    async def _text_address(self) -> int:
         # TODO: see if all types with .text have Control prefix
         #  and if so check that they have it
         offset = 736
@@ -175,26 +212,36 @@ class Window(PropertyClass):
         if await self.maybe_read_type_name() in ("ControlText", "ControlList"):
             offset = 712
 
-        base_address = await self.read_base_address() + offset
+        return await self.read_base_address() + offset
 
+    # See maybe_graphical_spell
+    async def maybe_text(self, *, check_type: bool = False, max_len: int = MAX_STRING) -> str:
+        """The window's text, or "" when it has none or it is longer than `max_len`.
+
+        A window whose text can outgrow MAX_STRING, such as the chat log, wants
+        maybe_text_tail instead: raising `max_len` here reads the whole of it.
+        """
         # NOT always a pointer: while the string's capacity still fits MSVC's inline
         # buffer, these 16 bytes hold the characters themselves. Reading them as an
         # address raised MemoryReadError on any control that had only ever shown a short
         # string -- a castle row reading "Ferme" faulted at 0x006D007200650046, which is
         # those letters. See MemoryObject._string_data_address for the layout, and for
         # why the test is capacity rather than length. read_wide_string decides by it.
-        return await self.read_wide_string(base_address)
+        return await self.read_wide_string(await self._text_address(), max_len=max_len)
+
+    async def maybe_text_tail(self, chars: int, *, max_len: int = MAX_STRING) -> tuple[str, bool]:
+        """The last `chars` characters of the window's text, and whether any came before them.
+
+        See MemoryObject.read_wide_string_tail. The chat log is the case it is for: it
+        passes MAX_STRING within a few dozen lines, and maybe_text then reads it as "".
+        """
+        return await self.read_wide_string_tail(await self._text_address(), chars, max_len=max_len)
 
     async def write_maybe_text(self, text: str):
         """
         Writing to this when there isn't actually a .text could crash
         """
-        offset = 736
-
-        if await self.maybe_read_type_name() in ("ControlText", "ControlList"):
-            offset = 712
-
-        address = await self.read_base_address() + offset
+        address = await self._text_address()
         # Not always a pointer, as maybe_text explains, and a pointer's buffer can be
         # shorter than the new text: _write_basic_string checks both.
         await self.write_wide_string(address, text)
