@@ -21,19 +21,23 @@ _SLOT_PATTERN = (
 _SLOT_DISPLACEMENT_AT = 3
 _SLOT_INSTRUCTION_LENGTH = 7
 
-# The function that applies a pending mode change, once a frame. It says where each field
-# below is, so a patch that moves one moves what is read here with it.
+# GamebryoClient::VidRestart, which applies a pending mode change: the frame function calls
+# it while the byte is set. It says where each field below is, so a patch that moves one
+# moves what is read here with it. The pattern starts after the prologue, which each
+# recompile has changed: r812087 and r813697 open the function differently, and from
+# `mov rbx, rcx` on their code is the same, distances and all. r806919 and r812087 also
+# inlined it into the frame function, where the old pattern was; r813697 does not.
 _FRAME_PATTERN = (
-    rb"\x48\x8B\xC4\x48\x89\x58\x10\x48\x89\x70\x18\x55\x57\x41\x56"
-    rb"\x48\x8D\x68\x88\x48\x81\xEC\x60\x01\x00\x00"
-    rb"\x0F\x29\x70\xD8\x0F\x29\x78\xC8\x44\x0F\x29\x40\xB8"
-    rb"\x48\x8B\x05....\x48\x33\xC4\x48\x89\x45\x20\x48\x8B\xD9"
+    rb"\x48\x8B\xD9"  # mov rbx, rcx
+    rb"\x48\x8B\x89...."  # mov rcx, [rcx + device]
+    rb"\xE8...."  # call
+    rb"\x85\xC0\x74."  # test eax, eax; je
 )
-_PENDING_TEST_AT = 0x3D  # cmp byte ptr [rcx + pending], 0
-_DEVICE_LOAD_AT = 0x4A  # mov rcx, [rcx + device]
-_DEVICE_SIZE_AT = 0x150  # mov esi, [rax + width]; mov r14d, [rax + height]
-_PENDING_CLEAR_AT = 0x1A0  # mov byte ptr [rbx + pending], 0
-_FRAME_CODE_LENGTH = 0x1A7
+_DEVICE_LOAD_AT = 0x3  # mov rcx, [rcx + device]
+_DEVICE_RELOAD_AT = 0xA5  # mov rax, [rbx + device]; test rax, rax; je
+_DEVICE_SIZE_AT = 0xB1  # mov edi, [rax + width]; mov esi, [rax + height]
+_PENDING_CLEAR_AT = 0x100  # mov byte ptr [rbx + pending], 0
+_FRAME_CODE_LENGTH = 0x107
 
 # What a render device's side can be: Direct3D 9's largest texture, and well under any
 # size the game offers. Memory that is not a device's size is rarely both.
@@ -51,7 +55,7 @@ class _FrameFields(NamedTuple):
 
 
 def _read_frame_fields(code: bytes) -> _FrameFields:
-    """Where the frame function's code says each field is; raises if it isn't the code expected."""
+    """Where VidRestart's code says each field is; raises if it isn't the code expected."""
 
     def expect(at: int, opcode: bytes, length: int, trailer: bytes = b""):
         found = code[at : at + length]
@@ -59,20 +63,32 @@ def _read_frame_fields(code: bytes) -> _FrameFields:
             raise VideoManagerError(f"Expected {opcode.hex()} at match + {at:#x}, read {found.hex()}")
         return found
 
-    tested = expect(_PENDING_TEST_AT, b"\x80\xB9", 7, b"\x00")
-    cleared = expect(_PENDING_CLEAR_AT, b"\xC6\x83", 7, b"\x00")
-    pending = struct.unpack_from("<I", tested, 2)[0]
-    if pending != struct.unpack_from("<I", cleared, 2)[0]:
+    def rax_dword(at: int) -> tuple[int, int]:
+        # mov r32, [rax + disp8], any destination: (the displacement, the instruction's length).
+        # A recompile picks the registers, and r813697 picked others than r806919.
+        prefix = 1 if code[at : at + 1] == b"\x44" else 0
+        found = code[at : at + prefix + 3]
+        if len(found) < prefix + 3 or found[prefix] != 0x8B or found[prefix + 1] & 0xC7 != 0x40:
+            raise VideoManagerError(f"Expected mov r32, [rax + disp8] at match + {at:#x}, read {found.hex()}")
+        return found[prefix + 2], prefix + 3
+
+    pending = struct.unpack_from("<I", expect(_PENDING_CLEAR_AT, b"\xC6\x83", 7, b"\x00"), 2)[0]
+
+    # The device is read twice, once to test it and once for its size, and both must agree.
+    # The pattern holds the first load.
+    device = struct.unpack_from("<I", code, _DEVICE_LOAD_AT + 3)[0]
+    reloaded = expect(_DEVICE_RELOAD_AT, b"\x48\x8B\x83", 12)
+    if reloaded[7:11] != b"\x48\x85\xC0\x74":
         raise VideoManagerError(
-            f"The pending byte is tested at {tested[2:6].hex()} and cleared at {cleared[2:6].hex()}"
+            f"Expected a test of the device at match + {_DEVICE_RELOAD_AT + 7:#x}, read {reloaded.hex()}"
         )
+    if device != struct.unpack_from("<I", reloaded, 3)[0]:
+        raise VideoManagerError(f"The device is loaded from {device:#x} and from {reloaded[3:7].hex()}")
 
-    device = struct.unpack_from("<I", expect(_DEVICE_LOAD_AT, b"\x48\x8B\x89", 7), 3)[0]
-    size = expect(_DEVICE_SIZE_AT, b"\x8B\x70", 7)
-    if size[3:6] != b"\x44\x8B\x70":
-        raise VideoManagerError(f"Expected the device's height at match + {_DEVICE_SIZE_AT + 3:#x}, read {size.hex()}")
+    width, length = rax_dword(_DEVICE_SIZE_AT)
+    height, _ = rax_dword(_DEVICE_SIZE_AT + length)
 
-    return _FrameFields(pending, device, size[2], size[6])
+    return _FrameFields(pending, device, width, height)
 
 
 class VideoManager(MemoryObject):
@@ -80,7 +96,7 @@ class VideoManager(MemoryObject):
     The game's video manager, which changes a running client's resolution
 
     Patches no game code: the manager comes from the static slot and its fields' offsets
-    from the frame function's code, so a resize has nothing to install or remove. Code is
+    from VidRestart's code, so a resize has nothing to install or remove. Code is
     static for the life of the process, so each scan runs once. Every way this can fail
     raises before anything is written.
 
@@ -144,9 +160,11 @@ class VideoManager(MemoryObject):
 
     async def pending_flag_offset(self) -> int:
         """
-        Where the pending byte is on the manager, read from the code that tests and clears it
+        Where the pending byte is on the manager, read from the code that clears it
 
-        A patch moves it, and the old offset is some other byte, so both sites have to agree.
+        A patch moves it, and the old offset is some other byte. r813697 tests it in the
+        frame function and no longer in VidRestart, so the clear is the one site the match
+        reaches; the device's two loads are what must agree.
         """
         return (await self._read_fields()).pending
 
