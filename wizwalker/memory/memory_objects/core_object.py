@@ -57,16 +57,16 @@ class CoreObject(DynamicMemoryObject, PropertyClass):
         await self.write_value_to_offset(192, val, Primitive.int16)
 
     async def mobile_id(self) -> int:
-        return await self.read_value_from_offset(194, Primitive.uint16)
+        return await self.read_value_from_offset(196, Primitive.uint16)
 
     async def write_mobile_id(self, val: int):
-        await self.write_value_to_offset(194, val, Primitive.uint16)
+        await self.write_value_to_offset(196, val, Primitive.uint16)
 
     async def scale(self) -> float:
-        return await self.read_value_from_offset(196, Primitive.float32)
+        return await self.read_value_from_offset(200, Primitive.float32)
 
     async def write_scale(self, val: float):
-        await self.write_value_to_offset(196, val, Primitive.float32)
+        await self.write_value_to_offset(200, val, Primitive.float32)
 
     # note: not defined
     async def parent(self) -> Optional["CoreObject"]:
