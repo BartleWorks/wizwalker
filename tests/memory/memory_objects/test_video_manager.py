@@ -38,20 +38,31 @@ def slot_store(at: int, slot: int = SLOT) -> bytes:
     )
 
 
-def frame_function(tested: int = PENDING, cleared: int = PENDING, device: int = DEVICE_FIELD) -> bytes:
-    """The frame function: its opening, and the sites that say where each field is."""
-    code = bytearray(0x1A8)
+#: VidRestart's two prologues: r812087's and r813697's, which the pattern starts after.
+PROLOGUES = (
+    b"\x48\x89\x5C\x24\x10\x48\x89\x74\x24\x18\x57\x48\x83\xEC\x70",
+    b"\x48\x8B\xC4\x57\x48\x81\xEC\x80\x00\x00\x00\x48\xC7\x40\xC0\xFE\xFF\xFF\xFF",
+)
+#: The device's size as r813697 reads it, into edi and esi.
+SIZE_READS = bytes([0x8B, 0x78, WIDTH_FIELD, 0x8B, 0x70, HEIGHT_FIELD])
+
+
+def frame_function(
+    cleared: int = PENDING, device: int = DEVICE_FIELD, reloaded: int | None = None, size: bytes = SIZE_READS
+) -> bytes:
+    """VidRestart from `mov rbx, rcx` on, as r813697 compiles it: the sites that say where each field is."""
+    code = bytearray(0x108)
     opening = (
-        b"\x48\x8B\xC4\x48\x89\x58\x10\x48\x89\x70\x18\x55\x57\x41\x56"
-        b"\x48\x8D\x68\x88\x48\x81\xEC\x60\x01\x00\x00"
-        b"\x0F\x29\x70\xD8\x0F\x29\x78\xC8\x44\x0F\x29\x40\xB8"
-        b"\x48\x8B\x05\x55\x66\x77\x08\x48\x33\xC4\x48\x89\x45\x20\x48\x8B\xD9"
+        b"\x48\x8B\xD9"  # mov rbx, rcx
+        + b"\x48\x8B\x89" + struct.pack("<I", device)  # mov rcx, [rcx + device]
+        + b"\xE8\x55\x66\x77\x08"  # call
+        + b"\x85\xC0\x74\x12"  # test eax, eax; je
     )
     code[: len(opening)] = opening
-    code[0x3D:0x44] = b"\x80\xB9" + struct.pack("<I", tested) + b"\x00"
-    code[0x4A:0x51] = b"\x48\x8B\x89" + struct.pack("<I", device)
-    code[0x150:0x157] = bytes([0x8B, 0x70, WIDTH_FIELD, 0x44, 0x8B, 0x70, HEIGHT_FIELD])
-    code[0x1A0:0x1A7] = b"\xC6\x83" + struct.pack("<I", cleared) + b"\x00"
+    reload = device if reloaded is None else reloaded
+    code[0xA5:0xB1] = b"\x48\x8B\x83" + struct.pack("<I", reload) + b"\x48\x85\xC0\x74\x4F"
+    code[0xB1 : 0xB1 + len(size)] = size
+    code[0x100:0x107] = b"\xC6\x83" + struct.pack("<I", cleared) + b"\x00"
     return bytes(code)
 
 
@@ -114,9 +125,16 @@ def test_the_slot_pattern_matches_the_store_and_not_its_vtable_writes_alone():
     assert not regex.search(_SLOT_PATTERN, slot_store(CODE)[7:], regex.DOTALL)
 
 
-def test_the_frame_pattern_matches_whatever_the_cookie_displacement():
+def test_the_frame_pattern_matches_whatever_the_device_field_and_the_call():
     assert regex.search(_FRAME_PATTERN, frame_function(), regex.DOTALL)
+    assert regex.search(_FRAME_PATTERN, frame_function(device=0x3CD08), regex.DOTALL)
     assert not regex.search(_FRAME_PATTERN, frame_function()[1:], regex.DOTALL)
+
+
+@pytest.mark.parametrize("prologue", PROLOGUES)
+def test_the_frame_pattern_matches_after_either_builds_prologue(prologue):
+    found = regex.search(_FRAME_PATTERN, prologue + frame_function(), regex.DOTALL)
+    assert found and found.start() == len(prologue)
 
 
 # --- the manager -------------------------------------------------------------
@@ -201,26 +219,40 @@ async def test_each_pattern_is_scanned_once(manager, monkeypatch):
 
 @pytest.mark.parametrize("offset", [0x2AB01, 0x3CD07])
 async def test_the_offset_comes_from_the_code(game, manager, offset):
-    replace_code(game, FRAME_AT, frame_function(offset, offset))
+    replace_code(game, FRAME_AT, frame_function(cleared=offset))
     assert await manager.pending_flag_offset() == offset
 
 
-async def test_sites_that_disagree_raise(game, manager):
-    replace_code(game, FRAME_AT, frame_function(0x2AB01, 0x2AB09))
-    with pytest.raises(VideoManagerError, match="tested at .* and cleared at"):
+async def test_device_loads_that_disagree_raise(game, manager):
+    replace_code(game, FRAME_AT, frame_function(reloaded=DEVICE_FIELD + 8))
+    with pytest.raises(VideoManagerError, match="loaded from .* and from"):
         await manager.pending_flag_offset()
+
+
+@pytest.mark.parametrize(
+    "size",
+    [
+        SIZE_READS,  # edi, esi: r813697
+        bytes([0x8B, 0x70, WIDTH_FIELD, 0x44, 0x8B, 0x70, HEIGHT_FIELD]),  # esi, r14d: r806919
+        bytes([0x44, 0x8B, 0x40, WIDTH_FIELD, 0x8B, 0x50, HEIGHT_FIELD]),  # r8d, edx
+    ],
+)
+async def test_the_size_is_read_whatever_registers_it_goes_to(game, manager, size):
+    replace_code(game, FRAME_AT, frame_function(size=size))
+    assert await manager.read_device_size() == (1280, 720)
 
 
 @pytest.mark.parametrize(
     ("site", "found"),
     [
-        (0x3D, b"\x80\xBA\x01\xAB\x02\x00\x00"),  # another register
-        (0x3D, b"\x80\xB9\x01\xAB\x02\x00\x01"),  # another value
-        (0x4A, b"\x48\x8B\x8B\x10\xAC\x02\x00"),  # another register
-        (0x150, b"\x8B\x78\x24\x44\x8B\x70\x28"),  # another register
-        (0x150, b"\x8B\x70\x24\x44\x8B\x78\x28"),  # another register for the height
-        (0x1A0, b"\xC6\x87\x01\xAB\x02\x00\x00"),  # another register
-        (0x1A0, b"\xC6\x83\x01\xAB\x02\x00\x01"),  # a set, not a clear
+        (0xA5, b"\x48\x8B\x81\x10\xAC\x02\x00"),  # another register
+        (0xAC, b"\x48\x85\xC9\x74"),  # a test of another register
+        (0xB1, b"\x8B\x7B\x24"),  # the width from another register
+        (0xB1, b"\x8B\xB8\x24\x00\x00\x00"),  # the width at a 32-bit displacement
+        (0xB4, b"\x8B\x71\x28"),  # the height from another register
+        (0xB4, b"\x48\x8B\x70\x28"),  # a 64-bit read
+        (0x100, b"\xC6\x87\x01\xAB\x02\x00\x00"),  # another register
+        (0x100, b"\xC6\x83\x01\xAB\x02\x00\x01"),  # a set, not a clear
     ],
 )
 async def test_code_that_is_not_the_expected_instruction_raises(game, manager, site, found):
@@ -278,7 +310,7 @@ async def test_a_node_with_no_string_writes_nothing(game, manager):
     [
         lambda game: game.put(SLOT, "Q", 0),
         lambda game: game.put(DEVICE + WIDTH_FIELD, "II", 0, 0),
-        lambda game: replace_code(game, FRAME_AT + 0x1A0, b"\xC6\x83\x09\xAB\x02\x00\x00"),
+        lambda game: replace_code(game, FRAME_AT + 0xA5, b"\x48\x8B\x83\x18\xAC\x02\x00"),
     ],
 )
 async def test_a_failed_check_writes_nothing(game, manager, break_it):
