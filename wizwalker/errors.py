@@ -162,6 +162,13 @@ class NotEnoughMana(WizWalkerCombatError):
     """
 
 
+class MemoryLoginError(WizWalkerError):
+    """
+    Raised when wizwalker.login cannot send a login, or the game did not run it;
+    the message never holds the credentials
+    """
+
+
 class CardAlreadyEnchanted(WizWalkerError):
     """
     Raised when trying to enchant an already enchanted card
