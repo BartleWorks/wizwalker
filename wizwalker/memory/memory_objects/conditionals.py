@@ -467,16 +467,16 @@ class ReqHangingEffectType(ConditionalSpellEffectRequirement):
         return await self.read_enum(88, SpellEffects)
 
     async def param_low(self) -> int:
-        return await self.read_value_from_offset(92, Primitive.int32)
-
-    async def param_high(self) -> int:
         return await self.read_value_from_offset(96, Primitive.int32)
 
-    async def min_count(self) -> int:
+    async def param_high(self) -> int:
         return await self.read_value_from_offset(100, Primitive.int32)
 
-    async def max_count(self) -> int:
+    async def min_count(self) -> int:
         return await self.read_value_from_offset(104, Primitive.int32)
+
+    async def max_count(self) -> int:
+        return await self.read_value_from_offset(108, Primitive.int32)
 
 
 class ReqPvPCombat(ConditionalSpellEffectRequirement):

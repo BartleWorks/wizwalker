@@ -41,3 +41,36 @@ async def test_in_battle_is_false_when_the_phase_cannot_be_read():
             raise MemoryReadError(0)
 
     assert await Client.in_battle(SimpleNamespace(duel=Duel())) is False
+
+
+async def test_the_camera_switch_calls_the_slot_the_clients_own_switch_calls():
+    import struct
+
+    class GameClient:
+        async def read_base_address(self):
+            return 0x2000_0000
+
+        async def select_camera_slot(self):
+            return 0x4A8
+
+    class HookHandler:
+        written = None
+
+        async def allocate(self, size):
+            return 0x7000
+
+        async def write_bytes(self, address, data):
+            self.written = data
+
+        async def start_thread(self, address):
+            pass
+
+        async def free(self, address):
+            pass
+
+    handler = HookHandler()
+    client = SimpleNamespace(game_client=GameClient(), hook_handler=handler)
+    await Client._switch_camera(client, 0x5555_0000, 0x6666_0000)
+
+    # set_cam is `mov rax, [rax+slot]` on the client's vtable, then called with r9 = it
+    assert b"\x48\x8B\x80" + struct.pack("<I", 0x4A8) + b"\x49\x89\xC1\xFF\xD0" in handler.written

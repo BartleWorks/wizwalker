@@ -653,7 +653,7 @@ class CombatParticipant(PropertyClass):
     #     return await self.read_value_from_offset(96, "class SharedPointer<class CombatCheatSettings>")
 
     async def is_monster(self) -> int:
-        return await self.read_value_from_offset(420, Primitive.uint32)
+        return await self.read_value_from_offset(428, Primitive.uint32)
 
     async def write_is_monster(self, is_monster: int):
         await self.write_value_to_offset(428, is_monster, Primitive.uint32)

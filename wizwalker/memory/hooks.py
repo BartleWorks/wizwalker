@@ -2,7 +2,7 @@ import asyncio
 import ctypes
 import ctypes.wintypes
 import struct
-from typing import Any, Tuple
+from typing import Any, NamedTuple, Tuple
 from contextlib import suppress
 import warnings
 
@@ -10,6 +10,7 @@ from loguru import logger
 import regex
 
 from .memory_reader import MemoryReader
+from wizwalker import PatternFailed
 from wizwalker.constants import kernel32
 
 
@@ -154,12 +155,24 @@ class AutoBotBaseHook(MemoryHook):
         await self.write_bytes(self.jump_address, self.jump_original_bytecode)
 
 
+class HookSite(NamedTuple):
+    """One build's site for a hook: its pattern, and how much the jump written there overwrites."""
+
+    pattern: bytes
+    instruction_length: int
+    noops: int
+
+
 class SimpleHook(AutoBotBaseHook):
     """
     Simple hook for writing hooks that are simple ofc
     """
 
     pattern = None
+    # A hook whose site differs between the game's compilers lists one HookSite per
+    # shape here instead of a pattern, and the first that matches is used. Its bytecode
+    # must then replay what the jump overwrote by reading it from the site.
+    sites: Tuple[HookSite, ...] = ()
     module = "WizardGraphicalClient.exe"
     instruction_length = 5
     exports = None
@@ -167,6 +180,21 @@ class SimpleHook(AutoBotBaseHook):
 
     async def get_pattern(self):
         return self.pattern, self.module
+
+    async def get_jump_address(self, pattern: bytes, module: str = None) -> int:
+        if not self.sites:
+            return await super().get_jump_address(pattern, module=module)
+
+        for site in self.sites:
+            try:
+                address = await self.pattern_scan(site.pattern, module=module)
+            except PatternFailed:
+                continue
+            self.instruction_length = site.instruction_length
+            self.noops = site.noops
+            return address
+
+        raise PatternFailed(self.sites[0].pattern)
 
     async def get_jump_bytecode(self) -> bytes:
         distance = self.hook_address - self.jump_address
@@ -567,20 +595,30 @@ class MovementTeleportHook(SimpleHook):
 
 class DropsToggleHook(SimpleHook):
     # The function that sends the "Loot" event, hooked at its entry so that it returns 0
-    # at once while drops are disabled. It names no string in .rdata on r806919, which
-    # builds "Loot" from an immediate, and loads it with `lea rdx, [rip+"Loot"]` on
-    # r811339; this runs from r811339's prologue through that string's setup (length 4)
-    # and matches once. The jump overwrites `sub rsp, 0x68` and the EH state store after
-    # it, 13 bytes, neither RIP-relative, replayed from the site.
-    pattern = (
-        rb"\x48\x83\xEC\x68\x48\xC7\x44\x24.\xFE\xFF\xFF\xFF\x48\x8B\x05....\x48\x33\xC4\x48\x89\x44\x24."
-        rb"\x48\x8D\x05....\x48\x89\x44\x24.\x48\x89\x54\x24."
-        rb"\x66\x0F\x6F\x05....\xF3\x0F\x7F\x44\x24.\xC6\x44\x24.\x00\x41\xB8\x04\x00\x00\x00\x48\x8D\x15...."
+    # at once while drops are disabled. Each compiler opens it differently, so there is a
+    # site for each (HookHandler.AUTOBOT_PATTERNS says which builds are which), and
+    # the instructions the jump overwrites are replayed from the site either way.
+    sites = (
+        # The old compiler builds "Loot" from an immediate, so the function names no
+        # string in .rdata. The jump overwrites `mov r11, rsp; sub rsp, 0x68`, 7 bytes.
+        HookSite(
+            rb"\x4C\x8B\xDC\x48\x83\xEC\x68\x48\x8B\x05....\x48\x33\xC4\x48\x89\x44\x24.\x48\x8D\x05....",
+            instruction_length=7,
+            noops=2,
+        ),
+        # The new compiler loads it with `lea rdx, [rip+"Loot"]`; this runs from its
+        # prologue through that string's setup (length 4). The jump overwrites
+        # `sub rsp, 0x68` and the EH state store after it, 13 bytes, neither RIP-relative.
+        HookSite(
+            rb"\x48\x83\xEC\x68\x48\xC7\x44\x24.\xFE\xFF\xFF\xFF\x48\x8B\x05....\x48\x33\xC4\x48\x89\x44\x24."
+            rb"\x48\x8D\x05....\x48\x89\x44\x24.\x48\x89\x54\x24."
+            rb"\x66\x0F\x6F\x05....\xF3\x0F\x7F\x44\x24.\xC6\x44\x24.\x00\x41\xB8\x04\x00\x00\x00\x48\x8D\x15....",
+            instruction_length=13,
+            noops=8,
+        ),
     )
 
-    instruction_length = 13
     exports = [("disable_drops_bool", 1)]
-    noops = 8
 
     async def bytecode_generator(self, packed_exports):
         # The instructions the jump overwrites, replayed when drops are not disabled
@@ -661,6 +699,20 @@ class User32GetClassInfoBaseHook(AutoBotBaseHook):
 
 
 class MouselessCursorMoveHook(User32GetClassInfoBaseHook):
+    # The window's "the mouse is over me" flag, at +0x190: its input handler clears it on
+    # WM_MOUSELEAVE and drops clicks and moves while it is clear, so a click sent while
+    # the real cursor is elsewhere is lost. The hook makes that clear store 1 instead.
+    # Each entry is a pattern for the clear, `mov byte [reg+0x190], 0; xor reg, reg; mov`,
+    # and where its immediate is from the match. r806919 and r813697 keep the window in
+    # rsi and zero edi; r812087 and r814353 keep it in r14, which takes a REX prefix, and
+    # zero esi. Do not loosen the first to `\xC6\x86...\x00\x00\x33\xFF`: on r814353
+    # that finds `mov byte [rsi+0x134], 0`, the mouse-look flag, and forcing mouse look
+    # on drops every click.
+    MOUSE_OVER_CLEARS = (
+        (rb"\xC6\x86...\x00\x00\x33\xFF\x89", 6),
+        (rb"\x41\xC6\x86...\x00\x00\x33\xF6\x89", 7),
+    )
+
     def __init__(self, memory_handler, hook_cache=None):
         super().__init__(memory_handler, hook_cache=hook_cache)
         self.mouse_pos_addr = None
@@ -712,22 +764,12 @@ class MouselessCursorMoveHook(User32GetClassInfoBaseHook):
         else:
             bool_one_address = self._get_cached("bool_one_address")
 
-        bool_two_address = None
         if not self._is_cached("bool_two_address"):
-            if a := await self.pattern_scan(
-                rb"\xC6\x86...\x00\x00\x33\xFF\x89",
-                module="WizardGraphicalClient.exe",
-            ):
-                self._cache("bool_two_address", a)
-                bool_two_address = a
-        else:
-            bool_two_address = self._get_cached("bool_two_address")
+            self._cache("bool_two_address", await self._find_mouse_over_clear())
+        bool_two_address = self._get_cached("bool_two_address")
 
-        if bool_one_address is None or bool_two_address is None:
+        if bool_one_address is None:
             raise RuntimeError("toogle bool address pattern failed")
-
-        # bool is 6 away from pattern target
-        bool_two_address += 6
 
         self.toggle_bool_addrs = (bool_one_address, bool_two_address)
 
@@ -745,6 +787,16 @@ class MouselessCursorMoveHook(User32GetClassInfoBaseHook):
 
         # ret + 5 noops
         await self.write_bytes(set_cursor_pos, b"\xC3" + (b"\x90" * 5))
+
+    async def _find_mouse_over_clear(self) -> int:
+        """The address of the immediate the mouse-over flag's clear stores."""
+        for pattern, immediate_at in self.MOUSE_OVER_CLEARS:
+            try:
+                found = await self.pattern_scan(pattern, module="WizardGraphicalClient.exe")
+            except PatternFailed:
+                continue
+            return found + immediate_at
+        raise PatternFailed(self.MOUSE_OVER_CLEARS[0][0])
 
     async def set_mouse_pos_addr(self):
         if not self._is_cached("mouse_pos_addr"):

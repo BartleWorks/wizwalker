@@ -14,6 +14,20 @@ from .gamebryo_presenter import DynamicGamebryoPresenter
 from .fishing_manager import FishingManager
 
 
+# The camera fields are found from the client's own camera switches, by patterns that name
+# none of the offsets they read, so a patch that moves the fields is followed, not missed.
+# The fallbacks are r814353's. Each pattern matches once on r812087 and r814353.
+#
+# Selecting the elastic camera: `mov rdx, [rbx+elastic]; call [rax+?]; mov byte [rbx+freecam], 0`.
+SELECT_ELASTIC_PATTERN = rb"\x48\x8B\x93....\xFF\x90....\xC6\x83....\x00"
+# Selecting the free camera: `mov rcx, [rbx+free]; call; mov byte [rbx+freecam], 1; mov byte [rbx+?], 1`.
+SELECT_FREE_PATTERN = rb"\x48\x8B\x8B....\xE8....\xC6\x83....\x01\xC6\x83....\x01"
+# The camera toggle: `cmp [rbx+selected], rdx; jne; mov rdx, [rbx+elastic]; call [rax+?]`.
+SELECTED_IS_ELASTIC_PATTERN = rb"\x48\x39\x93....\x75.\x48\x8B\x93....\xFF\x90...."
+# The freecam flag's clear in SELECT_ELASTIC_PATTERN, matched from its own `mov byte`.
+FREECAM_CLEAR_PATTERN = rb"(?<=\x48\x8B\x93....\xFF\x90....)\xC6\x83....\x00"
+
+
 # note: not defined
 class GameClient(MemoryObject):
     async def read_base_address(self) -> int:
@@ -21,12 +35,10 @@ class GameClient(MemoryObject):
 
     async def elastic_camera_controller(self) -> Optional[DynamicElasticCameraController]:
         offset = await self.pattern_scan_offset_cached(
-            rb"\x48\x8B\x93\xD8\x1F\x02\x00\x41\xFF\xD1\x32"
-            rb"\xC0\xEB\x05\x41\xFF\xD1\xB0\x01\x88\x83\x20"
-            rb"\x20\x02\x00\x48\x8B\x07\x33\xD2\x48\x8B\xCF",
+            SELECT_ELASTIC_PATTERN,
             3,
             "elastic_camera_controller",
-            0x222C8
+            0x222D0
         )
 
         addr = await self.read_value_from_offset(offset, Primitive.uint64)
@@ -36,13 +48,25 @@ class GameClient(MemoryObject):
 
         return DynamicElasticCameraController(self.hook_handler, addr)
 
+    async def select_camera_slot(self) -> int:
+        """
+        The client's vtable slot that makes a camera controller the selected one, read from
+        the call in the client's own switch to the elastic camera
+        """
+        # `\xFF\x90` and its displacement start 7 bytes into SELECT_ELASTIC_PATTERN
+        return await self.pattern_scan_offset_cached(
+            SELECT_ELASTIC_PATTERN,
+            9,
+            "select_camera_slot",
+            0x498
+        )
+
     async def free_camera_controller(self) -> Optional[DynamicFreeCameraController]:
         offset = await self.pattern_scan_offset_cached(
-            rb"\x48\x8B\x93....\x48\x8B\x03\x4C\x8B\x88...."
-            rb"\x41\xB8\x01\x00\x00\x00\x48\x8B\xCB\x48\x3B\xFA\x75",
+            SELECT_FREE_PATTERN,
             3,
             "free_camera_controller",
-            0x222D8
+            0x222E0
         )
 
         addr = await self.read_value_from_offset(offset, Primitive.uint64)
@@ -57,12 +81,10 @@ class GameClient(MemoryObject):
         The in use camera controller
         """
         offset = await self.pattern_scan_offset_cached(
-            rb"\x48\x89\x87\x08\x20\x02\x00\x48\x8D\x8F"
-            rb"\x10\x20\x02\x00\x48\x8D\x54\x24\x40\xE8"
-            rb"....\x90\x48\x8B\x4C\x24",
+            SELECTED_IS_ELASTIC_PATTERN,
             3,
             "selected_camera_controller",
-            0x222F8
+            0x22300
         )
 
         addr = await self.read_value_from_offset(offset, Primitive.uint64)
@@ -80,12 +102,10 @@ class GameClient(MemoryObject):
             selected_camera_controller = await selected_camera_controller.read_base_address()
 
         offset = await self.pattern_scan_offset_cached(
-            rb"\x48\x89\x87\x08\x20\x02\x00\x48\x8D\x8F"
-            rb"\x10\x20\x02\x00\x48\x8D\x54\x24\x40\xE8"
-            rb"....\x90\x48\x8B\x4C\x24",
+            SELECTED_IS_ELASTIC_PATTERN,
             3,
             "selected_camera_controller",
-            0x222F8
+            0x22300
         )
 
         await self.write_value_to_offset(offset, selected_camera_controller, Primitive.uint64)
@@ -95,12 +115,10 @@ class GameClient(MemoryObject):
         If the game is currently in freecam mode
         """
         offset = await self.pattern_scan_offset_cached(
-            rb"\x0F\xB6\x88\x20\x20\x02\x00\x88\x8B\x6A"
-            rb"\x02\x00\x00\x84\xC9\x0F\x85....\x48\x8D"
-            rb"\x55\xE0\x48\x8B\xCB\xE8",
-            3,
+            FREECAM_CLEAR_PATTERN,
+            2,
             "is_freecam",
-            0x22310
+            0x22318
         )
         return await self.read_value_from_offset(offset, Primitive.bool)
 
@@ -109,12 +127,10 @@ class GameClient(MemoryObject):
         Write if the game is currently in freecam mode
         """
         offset = await self.pattern_scan_offset_cached(
-            rb"\x0F\xB6\x88\x20\x20\x02\x00\x88\x8B\x6A"
-            rb"\x02\x00\x00\x84\xC9\x0F\x85....\x48\x8D"
-            rb"\x55\xE0\x48\x8B\xCB\xE8",
-            3,
+            FREECAM_CLEAR_PATTERN,
+            2,
             "is_freecam",
-            0x22310
+            0x22318
         )
         await self.write_value_to_offset(offset, is_freecam, Primitive.bool)
 
@@ -122,16 +138,10 @@ class GameClient(MemoryObject):
         """
         The root client object, all other client objects are its children
         """
-        offset = await self.pattern_scan_offset_cached(
-            rb"\x48\x8D\x93\xA0\x12\x02\x00\xFF\x90\xB8\x01"
-            rb"\x00\x00\x90\x48\x8B\x7C\x24\x30\x48\x85\xFF\x74\x2E\xBE"
-            rb"\xFF\xFF\xFF\xFF\x8B\xC6\xF0\x0F\xC1\x47\x08 ",
-            3,
-            "root_client_object",
-            0x21318
-        )
-
-        addr = await self.read_value_from_offset(offset, Primitive.uint64)
+        # A shared pointer the client copies in some 170 places, none of them telling enough
+        # to anchor a pattern on, so it is read where r814353 keeps it: the top of the
+        # player's parent chain, found there in a live client.
+        addr = await self.read_value_from_offset(0x21378, Primitive.uint64)
 
         if addr == 0:
             return None
@@ -143,11 +153,11 @@ class GameClient(MemoryObject):
         The number of frames processed the last second, updated every 5 seconds by default
         """
         offset = await self.pattern_scan_offset_cached(
-            rb"\xF3\x0F\x11\x8B\xFC\x19\x02\x00\xC7\x05........\xF2\x0F"
-            rb"\x11.....\x48\x8B\x8B\x00\x13\x02\x00\x48\x85\xC9\x74\x09",
+            rb"\xF3\x0F\x11\x8B....\xC7\x05........\xF2\x0F"
+            rb"\x11.....\x48\x8B\x8B....\x48\x85\xC9\x74\x09",
             4,
             "frames_per_second",
-            0x219FC
+            0x21A7C
         )
         return await self.read_value_from_offset(offset, Primitive.float32)
 
@@ -175,24 +185,30 @@ class GameClient(MemoryObject):
         )
         await self.write_value_to_offset(offset, shutdown_signal, Primitive.int32)
 
+    # The ids below are r814353's, each checked in a live client: user_id is what the
+    # login handler stores beside "UserID" and "SupportID", player_gid what the client
+    # compares its own objects' ids against ("Our client is getting hurt!") and equal to
+    # the player's global id, machine_id what it logs as "MachineID: %llu".
+
     async def user_id(self) -> int:
         """Account-level UserID from MSG_USER_VALIDATE / MSG_CHARACTERSELECTED."""
         return await self.read_value_from_offset(0x21258, Primitive.uint64)
 
     async def player_gid(self) -> int:
         """Current character's global ID (CharID from MSG_CHARACTERSELECTED)."""
-        return await self.read_value_from_offset(0x214C0, Primitive.uint64)
+        return await self.read_value_from_offset(0x213A8, Primitive.uint64)
 
     async def machine_id(self) -> int:
         """MachineID sent during login."""
-        return await self.read_value_from_offset(0x214C8, Primitive.uint64)
+        return await self.read_value_from_offset(0x21508, Primitive.uint64)
 
     async def character_registry(self) -> Optional[DynamicCharacterRegistry]:
         """
         Get the character registry
         """
-        # TODO: find where this loaded in for offset pattern
-        addr = await self.read_value_from_offset(0x224A8, Primitive.uint64)
+        # Where r814353 keeps it, checked against the registry Client.character_registry
+        # finds by its own pattern, which is the one to prefer.
+        addr = await self.read_value_from_offset(0x227A0, Primitive.uint64)
 
         if addr == 0:
             return None
@@ -201,42 +217,42 @@ class GameClient(MemoryObject):
 
     async def account_permissions(self) -> AccountPermissions:
         offset = await self.pattern_scan_offset_cached(
-            rb"\x41\x89\x86\x3C\x1D\x02\x00\x4D\x8B\x06\x8B"
-            rb"\xD0\x49\x8B\xCE\x41\xFF\x90\x10\x04\x00\x00"
-            rb"\x49\x8B\x06\x49\x8B\xCE\xFF\x90\x58\x01\x00\x00",
+            rb"\x41\x89\x86....\x4D\x8B\x06\x8B"
+            rb"\xD0\x49\x8B\xCE\x41\xFF\x90...."
+            rb"\x49\x8B\x06\x49\x8B\xCE\xFF\x90....",
             3,
             "account_permissions",
-            0x21D3C
+            0x21DC4
         )
         return await self.read_enum(offset, AccountPermissions)
 
     async def write_account_permissions(self, account_permissions: AccountPermissions):
         offset = await self.pattern_scan_offset_cached(
-            rb"\x41\x89\x86\x3C\x1D\x02\x00\x4D\x8B\x06\x8B"
-            rb"\xD0\x49\x8B\xCE\x41\xFF\x90\x10\x04\x00\x00"
-            rb"\x49\x8B\x06\x49\x8B\xCE\xFF\x90\x58\x01\x00\x00",
+            rb"\x41\x89\x86....\x4D\x8B\x06\x8B"
+            rb"\xD0\x49\x8B\xCE\x41\xFF\x90...."
+            rb"\x49\x8B\x06\x49\x8B\xCE\xFF\x90....",
             3,
             "account_permissions",
-            0x21D3C
+            0x21DC4
         )
         await self.write_enum(offset, account_permissions)
 
     async def has_membership(self) -> bool:
         offset = await self.pattern_scan_offset_cached(
-            rb"\x83\xBB\x40\x1D\x02\x00\x00\x75\x04\xB2\x01\xEB\x02\x33\xD2\x48\x8B.....\xE8",
+            rb"\x83\xBB....\x00\x75\x04\xB2\x01\xEB\x02\x33\xD2\x48\x8B.....\xE8",
             2,
             "has_membership",
-            0x21D40
+            0x21DC8
         )
         return await self.read_value_from_offset(offset, Primitive.bool)
 
     # no, this doesn't let you go in membership areas
     async def write_has_membership(self, has_membership: bool):
         offset = await self.pattern_scan_offset_cached(
-            rb"\x83\xBB\x40\x1D\x02\x00\x00\x75\x04\xB2\x01\xEB\x02\x33\xD2\x48\x8B.....\xE8",
+            rb"\x83\xBB....\x00\x75\x04\xB2\x01\xEB\x02\x33\xD2\x48\x8B.....\xE8",
             2,
             "has_membership",
-            0x21D40
+            0x21DC8
         )
         await self.write_value_to_offset(offset, has_membership, Primitive.bool)
 
@@ -248,7 +264,7 @@ class GameClient(MemoryObject):
             rb".......\x48\x8B\x01\xFF\x50\x40\x84\xC0\x75.\xE8",
             3,
             "gamebryo_presenter",
-            0x21FB8
+            0x222B0
         )
 
         addr = await self.read_value_from_offset(offset, Primitive.uint64)
@@ -259,7 +275,9 @@ class GameClient(MemoryObject):
         return DynamicGamebryoPresenter(self.hook_handler, addr)
 
     async def fishing_manager(self) -> FishingManager:
-        addr = await self.read_value_from_offset(0x231a8, Primitive.uint64)
+        # A pointer the client calls through (`mov rcx, [rcx+0x231D0]; call`) on r814353;
+        # 0x231A8, which this read before, holds an id the client compares against.
+        addr = await self.read_value_from_offset(0x231D0, Primitive.uint64)
         return FishingManager(self.hook_handler, addr)
 
 class CurrentGameClient(GameClient):

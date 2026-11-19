@@ -138,10 +138,10 @@ class SpellEffect(PropertyClass):
         await self.write_value_to_offset(169, converted, Primitive.bool)
 
     async def rank(self) -> int:
-        return await self.read_value_from_offset(208, Primitive.int32)
+        return await self.read_value_from_offset(212, Primitive.int32)
 
     async def write_rank(self, rank: int):
-        await self.write_value_to_offset(208, rank, Primitive.int32)
+        await self.write_value_to_offset(212, rank, Primitive.int32)
 
     async def maybe_effect_list(self, *, check_type: bool = False) -> List["DynamicSpellEffect"]:
         if check_type:

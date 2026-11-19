@@ -6,6 +6,7 @@ from wizwalker.memory.memory_objects.conditionals import (
     HangingSpellEffect,
     ReqCombatHealth,
     ReqHangingCharm,
+    ReqHangingEffectType,
     ReqMinion,
     ReqPipCount,
 )
@@ -175,3 +176,18 @@ async def test_hanging_charms_count_within_the_window(process, hook_handler):
 async def test_requirements_combine_by_their_operator(process, hook_handler, operator, apply_not, before, state, expected):
     req = requirement(process, hook_handler, ReqPipCount, operator=operator, apply_not=apply_not)
     assert await req._do_ops(before, state) is expected
+
+
+async def test_a_hanging_effect_requirement_reads_its_fields_after_the_disposition(process, hook_handler):
+    # m_effectType 88, m_disposition 92, then m_param_low, m_param_high, m_min_count, m_max_count
+    req = requirement(
+        process,
+        hook_handler,
+        ReqHangingEffectType,
+        fields={92: ("i", 2), 96: ("i", 10), 100: ("i", 20), 104: ("i", 1), 108: ("i", 3)},
+    )
+
+    assert await req.param_low() == 10
+    assert await req.param_high() == 20
+    assert await req.min_count() == 1
+    assert await req.max_count() == 3
