@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import regex
 
+from wizwalker import PatternFailed
 from wizwalker.memory import hooks
 from wizwalker.memory.handler import HookHandler
 
@@ -99,8 +100,16 @@ async def test_the_autobot_refuses_more_than_it_holds(autobot):
 
 # --- drops ---------------------------------------------------------------------
 
-# The "Loot" event sender's opening as r811339 compiles it, with made-up operands
-_LOOT_SENDER = bytes.fromhex(
+# The "Loot" event sender's opening as each compiler builds it, with made-up operands.
+# The old compiler (r806919, r812087, r814353):
+_OLD_LOOT_SENDER = bytes.fromhex(
+    "4c 8b dc"  # mov r11, rsp (the jump overwrites this...)
+    "48 83 ec 68"  # sub rsp, 0x68 (...and this)
+    "48 8b 05 11 11 11 11 48 33 c4 48 89 44 24 58"  # the stack cookie
+    "48 8d 05 22 22 22 22"  # the handler
+)
+# The new compiler (r811339, r813697):
+_NEW_LOOT_SENDER = bytes.fromhex(
     "48 83 ec 68"  # sub rsp, 0x68 (the jump overwrites this...)
     "48 c7 44 24 30 fe ff ff ff"  # mov qword [rsp+0x30], -2 (...and this)
     "48 8b 05 11 11 11 11 48 33 c4 48 89 44 24 58"  # the stack cookie
@@ -108,20 +117,59 @@ _LOOT_SENDER = bytes.fromhex(
     "66 0f 6f 05 33 33 33 33 f3 0f 7f 44 24 48 c6 44 24 38 00"  # an empty string
     "41 b8 04 00 00 00 48 8d 15 44 44 44 44"  # assigned "Loot", four characters
 )
+_OLD_DROPS, _NEW_DROPS = hooks.DropsToggleHook.sites
+_LOOT_SENDERS = [(_OLD_LOOT_SENDER, _OLD_DROPS), (_NEW_LOOT_SENDER, _NEW_DROPS)]
 
 
-def test_the_drops_hook_finds_the_loot_sender():
-    page = b"\xcc" * 16 + _LOOT_SENDER + b"\xcc" * 16
-    assert [m.start() for m in regex.finditer(hooks.DropsToggleHook.pattern, page, regex.DOTALL)] == [16]
+@pytest.fixture
+def loaded_function(process, monkeypatch):
+    """Lays one build's function out at JUMP, and scans for patterns over it as the client would."""
+
+    def install(function: bytes):
+        process.map(JUMP, function)
+
+        async def scan(self, pattern, *, module=None, return_multiple=False):
+            found = _scan(pattern, function)
+            if not found:
+                raise PatternFailed(pattern)
+            return JUMP + found[0]
+
+        monkeypatch.setattr(hooks.MemoryReader, "pattern_scan", scan)
+
+    return install
 
 
-async def test_the_drops_hook_replays_what_its_jump_overwrites(process, hook_handler):
-    hook = hooks.DropsToggleHook(hook_handler)
-    hook.jump_address = process.map(0x7000, _LOOT_SENDER)
-    code = await hook.bytecode_generator([("disable_drops_bool", struct.pack("<Q", 0x1234))])
-    assert code.endswith(_LOOT_SENDER[:13])
+@pytest.mark.parametrize("function, site", _LOOT_SENDERS, ids=["old", "new"])
+def test_each_drops_site_finds_its_builds_loot_sender_and_not_the_others(function, site):
+    other = _NEW_LOOT_SENDER if function is _OLD_LOOT_SENDER else _OLD_LOOT_SENDER
+    page = b"\xcc" * 16 + function + b"\xcc" * 16
+    assert _scan(site.pattern, page) == [16]
+    assert _scan(site.pattern, b"\xcc" * 16 + other + b"\xcc" * 16) == []
+
+
+@pytest.mark.parametrize("function, site", _LOOT_SENDERS, ids=["old", "new"])
+async def test_the_drops_hook_takes_its_builds_site_and_replays_what_it_overwrites(
+    process, autobot, loaded_function, function, site
+):
+    loaded_function(function)
+    hook = hooks.DropsToggleHook(autobot)
+    await hook.hook()
+
+    assert (hook.instruction_length, hook.noops) == (site.instruction_length, site.noops)
+    # The jump and its nops cover the instructions it overwrites, and no more
+    assert len(hook.jump_bytecode) == site.instruction_length
+    # Enabled, the cave runs those instructions and jumps back after them
+    code = hook.hook_bytecode
+    assert code[:-5].endswith(function[: site.instruction_length])
+    assert decode_jmp(code[-5:], hook.hook_address + len(code) - 5) == JUMP + site.instruction_length
     # Disabled, it returns before them: `xor rax, rax; ret` comes first
-    assert code.index(b"\x48\x31\xc0\xc3") < len(code) - 13
+    assert code.index(b"\x48\x31\xc0\xc3") < len(code) - 5 - site.instruction_length
+
+
+async def test_a_hook_with_sites_raises_when_none_of_them_matches(autobot, loaded_function):
+    loaded_function(b"\xcc" * 64)
+    with pytest.raises(PatternFailed):
+        await hooks.DropsToggleHook(autobot).hook()
 
 
 # --- the root window -----------------------------------------------------------
@@ -297,6 +345,36 @@ async def test_the_user32_region_is_put_back_as_far_as_it_was_used(process, hook
 
     assert process.read_bytes(class_info, 256) == bytes(range(256))
     assert process.read_bytes(hook.jump_address, 5) == b"orig!"
+
+
+# The window input handler's clear of its mouse-over flag on WM_MOUSELEAVE, each
+# build's way, with the clear of the mouse-look flag beside it that a loose pattern finds
+_OLD_MOUSE_OVER_CLEAR = bytes.fromhex("c6 86 90 01 00 00 00 33 ff 89 7d 70")  # [rsi+0x190]; xor edi
+_NEW_MOUSE_OVER_CLEAR = bytes.fromhex("41 c6 86 90 01 00 00 00 33 f6 89 b5 70 01 00 00")  # [r14+0x190]; xor esi
+_MOUSE_LOOK_CLEAR = bytes.fromhex("c6 86 34 01 00 00 00 33 ff 48 89 7c 24 70")  # [rsi+0x134]; xor edi
+
+
+@pytest.mark.parametrize(
+    "clear, immediate_at",
+    [(_OLD_MOUSE_OVER_CLEAR, 6), (_NEW_MOUSE_OVER_CLEAR, 7)],
+    ids=["r806919 and r813697", "r812087 and r814353"],
+)
+async def test_the_mouseless_hook_finds_the_mouse_over_clears_immediate(
+    process, hook_handler, loaded_function, clear, immediate_at
+):
+    # The mouse-look clear comes first, as a scan from the module's start would meet it
+    loaded_function(_MOUSE_LOOK_CLEAR + b"\xcc" * 4 + clear)
+    found = await hooks.MouselessCursorMoveHook(hook_handler)._find_mouse_over_clear()
+
+    assert found == JUMP + len(_MOUSE_LOOK_CLEAR) + 4 + immediate_at
+    # The byte it will overwrite is the clear's 0, the last byte of `mov byte [reg+0x190], 0`
+    assert process.read_bytes(found - 4, 5) == bytes.fromhex("90 01 00 00 00")
+
+
+async def test_the_mouseless_hook_does_not_settle_for_the_mouse_look_clear(hook_handler, loaded_function):
+    loaded_function(_MOUSE_LOOK_CLEAR)
+    with pytest.raises(PatternFailed):
+        await hooks.MouselessCursorMoveHook(hook_handler)._find_mouse_over_clear()
 
 
 async def test_the_mouseless_hook_answers_get_cursor_pos_as_it_would(process, hook_handler):

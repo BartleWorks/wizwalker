@@ -104,3 +104,15 @@ async def test_in_battle_reads_the_phase(process, hook_handler):
     process.put(0x10000 + 196, "i", DuelPhase.planning.value)
     assert await current.duel_phase() is DuelPhase.planning
     assert await Client.in_battle(SimpleNamespace(duel=current)) is True
+
+
+async def test_each_teams_max_archmastery_is_its_own_float(process, hook_handler):
+    from wizwalker.memory.memory_objects.duel import DynamicDuel
+
+    process.map(0x40000, size=0x300)
+    process.put(0x40000 + 568, "f", 12.5)
+    process.put(0x40000 + 572, "f", 7.25)
+    duel = DynamicDuel(hook_handler, 0x40000)
+
+    assert await duel.max_archmastery_team0() == 12.5
+    assert await duel.max_archmastery_team1() == 7.25

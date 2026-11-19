@@ -746,6 +746,9 @@ class Client:
 
         packed_new_camera_address = _pack(new_camera_address)
         packed_old_camera_address = _pack(old_camera_address)
+        # The slot moved with Ahmarra (0x478 before it, 0x498 on r812087 and r814353), and
+        # calling the wrong one runs some other virtual function of the client's
+        packed_select_slot = struct.pack("<I", await self.game_client.select_camera_slot())
 
         # fmt: off
         shellcode = (
@@ -761,7 +764,7 @@ class Client:
                 b"\x48\xBA" + packed_new_camera_address +  # mov rdx, new_cam_addr
                 b"\x49\xC7\xC0\x01\x00\x00\x00"  # mov r8, 0x1
                 b"\x48\x8B\x01"  # mov rax, [rcx]
-                b"\x48\x8B\x80\x78\x04\x00\x00"  # mov rax, [rax+0x478]
+                b"\x48\x8B\x80" + packed_select_slot +  # mov rax, [rax+select_camera_slot]
                 b"\x49\x89\xC1"  # mov r9, rax
                 b"\xFF\xD0"  # call rax
 

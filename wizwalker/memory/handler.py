@@ -6,7 +6,7 @@ import warnings
 import pymem
 from loguru import logger
 
-from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady, MemoryReadError
+from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady, MemoryReadError, PatternFailed
 from .hooks import (
     ChatHook,
     ChatSendHook,
@@ -33,22 +33,38 @@ class HookHandler(MemoryReader):
     # The code cave every SimpleHook is written into: AutobotManager::Initialize, which
     # runs once at startup and never again, so overwriting it is safe. It names itself
     # in a string ("AutobotManager::Initialize"), which is how to find it again after a
-    # patch: the function that refers to that string. r811339 recompiled it with a
-    # `mov rax, rsp` frame and an EH state store, so it has nothing of the r806919
-    # prologue left; this matches r811339's prologue through the body's opening
-    # `cmp byte [rax+?], 0; je`, which it alone has.
-    AUTOBOT_PATTERN = (
-        rb"\x48\x8B\xC4"  # mov rax, rsp
-        rb"\x55\x41\x54\x41\x55\x41\x56\x41\x57"  # push rbp, r12, r13, r14, r15
-        rb"\x48\x8D\xA8....\x48\x81\xEC...."  # lea rbp, [rax-?]; sub rsp, ?
-        rb"\x48\xC7\x45.\xFE\xFF\xFF\xFF"  # mov qword [rbp-?], -2
-        rb"\x48\x89\x58.\x48\x89\x70.\x48\x89\x78."  # mov [rax+?], rbx / rsi / rdi
-        rb"\x48\x8B\x05....\x48\x33\xC4\x48\x89\x85...."  # the stack cookie
-        rb"\x4C\x8B\xE9\x48\x8B\x05....\x80\xB8....\x00\x0F\x84...."  # mov r13, rcx; ...; cmp; je
+    # patch: the function that refers to that string.
+    #
+    # KingsIsle has shipped it from two compilers, and gone back and forth between them:
+    # the old one (r806919, then r812087 on the Test realm and r814353 live) and the new
+    # one (r811339 on the Test realm, r813697 live). The two have nothing of each other's
+    # prologue, so there is a pattern for each, tried in turn; each matches once on its
+    # own builds and nowhere on the other's.
+    AUTOBOT_PATTERNS = (
+        # The old compiler: a frame through rbp with the saves above the return address,
+        # through the body's opening `mov r14, rcx; ...; cmp byte [rax+?], 0; je`.
+        (
+            rb"\x48\x89\x5C\x24.\x48\x89\x74\x24.\x48\x89\x7C\x24."  # mov [rsp+?], rbx / rsi / rdi
+            rb"\x55\x41\x54\x41\x55\x41\x56\x41\x57"  # push rbp, r12, r13, r14, r15
+            rb"\x48\x8D\xAC\x24....\x48\x81\xEC...."  # lea rbp, [rsp-?]; sub rsp, ?
+            rb"\x48\x8B\x05....\x48\x33\xC4\x48\x89\x85...."  # the stack cookie
+            rb"\x4C\x8B\xF1.......\x80......\x0F\x84...."  # mov r14, rcx; ...; cmp; je
+        ),
+        # The new compiler: a `mov rax, rsp` frame and an EH state store, through the
+        # body's opening `cmp byte [rax+?], 0; je`, which it alone of 296 such prologues has.
+        (
+            rb"\x48\x8B\xC4"  # mov rax, rsp
+            rb"\x55\x41\x54\x41\x55\x41\x56\x41\x57"  # push rbp, r12, r13, r14, r15
+            rb"\x48\x8D\xA8....\x48\x81\xEC...."  # lea rbp, [rax-?]; sub rsp, ?
+            rb"\x48\xC7\x45.\xFE\xFF\xFF\xFF"  # mov qword [rbp-?], -2
+            rb"\x48\x89\x58.\x48\x89\x70.\x48\x89\x78."  # mov [rax+?], rbx / rsi / rdi
+            rb"\x48\x8B\x05....\x48\x33\xC4\x48\x89\x85...."  # the stack cookie
+            rb"\x4C\x8B\xE9\x48\x8B\x05....\x80\xB8....\x00\x0F\x84...."  # mov r13, rcx; ...; cmp; je
+        ),
     )
-    # All of it is zeroed when the cave is prepared, so it must fit in the function:
-    # 3,975 bytes on r811339 (4,188 on r806919), rounded down. Hooking everything once
-    # reserves 1,050 of it.
+    # All of it is zeroed when the cave is prepared, so it must fit in the function on
+    # every build: 3,975 bytes from the new compiler, 4,188 from the old, rounded down.
+    # Hooking everything once reserves 1,050 of it.
     AUTOBOT_SIZE = 3968
 
     def __init__(self, process: pymem.Pymem, client):
@@ -57,6 +73,8 @@ class HookHandler(MemoryReader):
         self.client = client
 
         self._autobot_address = None
+        # Which of AUTOBOT_PATTERNS found it, and so how much of it to write back
+        self._autobot_pattern = None
         self._autobot_lock = None
         self._original_autobot_bytes = b""
         self._autobot_pos = 0
@@ -84,13 +102,16 @@ class HookHandler(MemoryReader):
         return addr
 
     async def _get_autobot_address(self):
-        addr = await self.pattern_scan(
-            self.AUTOBOT_PATTERN, module="WizardGraphicalClient.exe"
-        )
-        if addr is None:
-            raise RuntimeError("Pattern scan failed for autobot pattern")
+        for pattern in self.AUTOBOT_PATTERNS:
+            try:
+                addr = await self.pattern_scan(pattern, module="WizardGraphicalClient.exe")
+            except PatternFailed:
+                continue
+            self._autobot_address = addr
+            self._autobot_pattern = pattern
+            return
 
-        self._autobot_address = addr
+        raise RuntimeError("Pattern scan failed for every autobot pattern")
 
     # noinspection PyTypeChecker
     async def _prepare_autobot(self):
@@ -99,7 +120,7 @@ class HookHandler(MemoryReader):
 
             # we only need to write back the pattern
             self._original_autobot_bytes = await self.read_bytes(
-                self._autobot_address, len(self.AUTOBOT_PATTERN)
+                self._autobot_address, len(self._autobot_pattern)
             )
             logger.debug(
                 f"Got original bytes {self._original_autobot_bytes} from autobot"
@@ -109,7 +130,7 @@ class HookHandler(MemoryReader):
     async def _rewrite_autobot(self):
         if self._autobot_address is not None:
             compare_bytes = await self.read_bytes(
-                self._autobot_address, len(self.AUTOBOT_PATTERN)
+                self._autobot_address, len(self._original_autobot_bytes)
             )
             # Give some time for execution point to leave hooks
             await asyncio.sleep(0.5)
@@ -150,6 +171,7 @@ class HookHandler(MemoryReader):
             self._active_hooks = {}
             self._autobot_pos = 0
             self._autobot_address = None
+            self._autobot_pattern = None
             self._base_addrs = {}
 
         if first_error is not None:
