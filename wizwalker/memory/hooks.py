@@ -9,6 +9,8 @@ import warnings
 from loguru import logger
 import regex
 
+import pymem.process
+
 from .memory_reader import MemoryReader
 from wizwalker import PatternFailed
 from wizwalker.constants import kernel32
@@ -635,6 +637,29 @@ class DropsToggleHook(SimpleHook):
         )
 
 
+_own_kernel32 = ctypes.WinDLL("kernel32")
+_own_kernel32.GetModuleHandleW.argtypes = (ctypes.wintypes.LPCWSTR,)
+_own_kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+
+
+def _clean_user32_bytes(process, address: int, size: int) -> bytes | None:
+    """The bytes at *address* as user32 has them unhooked, from this process's own copy; None if there is none to read.
+
+    Windows maps a system DLL at one base for every process of a boot, so while the game's
+    user32 sits at ours, our copy holds its code, unpatched, at the same address.
+    """
+    try:
+        game = pymem.process.module_from_name(process.process_handle, "user32.dll")
+        ours = _own_kernel32.GetModuleHandleW("user32.dll")
+        if game is None or not ours or game.lpBaseOfDll != ours:
+            return None
+        if not (ours <= address and address + size <= ours + game.SizeOfImage):
+            return None
+        return ctypes.string_at(address, size)
+    except Exception:
+        return None
+
+
 # TODO: fix this hacky class
 class User32GetClassInfoBaseHook(AutoBotBaseHook):
     """
@@ -673,7 +698,7 @@ class User32GetClassInfoBaseHook(AutoBotBaseHook):
         # past them is touched: the region used to be zeroed whole, 1200 bytes, which
         # ran out of GetClassInfoExA and over the user32 code after it.
         if self._autobot_original_bytes is None:
-            self._autobot_original_bytes = await self.read_bytes(
+            self._autobot_original_bytes = await self._original_user32_bytes(
                 self._autobot_addr, self.AUTOBOT_SIZE
             )
 
@@ -681,6 +706,26 @@ class User32GetClassInfoBaseHook(AutoBotBaseHook):
         self._autobot_bytes_offset += size
 
         return addr
+
+    async def _original_user32_bytes(self, address: int, size: int) -> bytes:
+        """What user32 holds at *address* unhooked, which the game's own copy may not.
+
+        A hook cut short used to leave its code, and its jump at GetCursorPos, written in
+        the game with nothing to take them out. The next hook read them as the original
+        and its unhook wrote them back, so from then on GetCursorPos reported the parked
+        cursor and every click by hand missed, until the game was closed. Our own user32 is
+        the clean copy while it shares the game's base; without it, the game's bytes are
+        all there is.
+        """
+        found = await self.read_bytes(address, size)
+        clean = _clean_user32_bytes(self.process, address, size)
+        if clean is None or clean == found:
+            return found
+        logger.warning(
+            f"user32 at {address:#x} holds a hook's leftovers in the game; "
+            f"{type(self).__name__} will put back the clean bytes when it unhooks"
+        )
+        return clean
 
     async def hook(self) -> Any:
         self._hooked_instances += 1
@@ -721,72 +766,68 @@ class MouselessCursorMoveHook(User32GetClassInfoBaseHook):
         self.set_cursor_pos = None
 
     async def hook(self):
-        """
-        Writes jump_bytecode to jump address and hook bytecode to hook address
+        """Write the hook into GetClassInfoExA, its jump at GetCursorPos, the two toggles, and a ret at SetCursorPos.
+
+        Every lookup comes first, and nothing is written until all of them are done. The
+        symbol lookups and pattern scans await an executor, which is where a cancel lands,
+        and one used to land after the jump was written and before the handler recorded
+        the hook, leaving the jump in the game with nothing to take it out. The writes
+        after them never yield, and if one of them fails, what was written is undone.
         """
         self._hooked_instances += 1
 
         self.jump_address = await self.get_jump_address()
         self.hook_address = await self.get_hook_address(50)
+        self.hook_bytecode = await self.get_hook_bytecode()
+        self.jump_bytecode = await self.get_jump_bytecode()
+        self.jump_original_bytecode = await self._original_user32_bytes(
+            self.jump_address, len(self.jump_bytecode)
+        )
+        toggle_bool_addrs = await self._find_toggle_bools()
+        set_cursor_pos = await self._find_set_cursor_pos()
+        set_cursor_pos_original = await self._original_user32_bytes(set_cursor_pos, 6)
 
         logger.debug(f"Got hook address {self.hook_address} in {type(self)}")
         logger.debug(f"Got jump address {self.jump_address} in {type(self)}")
-
-        self.hook_bytecode = await self.get_hook_bytecode()
-        self.jump_bytecode = await self.get_jump_bytecode()
-
-        logger.debug(f"Got hook bytecode {self.hook_bytecode} in {type(self)}")
-        logger.debug(f"Got jump bytecode {self.jump_bytecode} in {type(self)}")
-
-        self.jump_original_bytecode = await self.read_bytes(
-            self.jump_address, len(self.jump_bytecode)
-        )
-
         logger.debug(
             f"Got jump original bytecode {self.jump_original_bytecode} in {type(self)}"
         )
 
-        await self.prehook()
+        self.toggle_bool_addrs = toggle_bool_addrs
+        self.set_cursor_pos = (set_cursor_pos, set_cursor_pos_original)
+        try:
+            await self.write_bytes(self.hook_address, self.hook_bytecode)
+            await self.write_bytes(self.jump_address, self.jump_bytecode)
+            for bool_addr in self.toggle_bool_addrs:
+                await self.write_bytes(bool_addr, b"\x01")
+            # ret + 5 noops
+            await self.write_bytes(set_cursor_pos, b"\xC3" + (b"\x90" * 5))
+        except BaseException:
+            # Every original was read before the first write, so putting them all back
+            # undoes exactly what was written, and leaves the rest as it was
+            with suppress(Exception):
+                await self.unhook()
+            raise
 
-        await self.write_bytes(self.hook_address, self.hook_bytecode)
-        await self.write_bytes(self.jump_address, self.jump_bytecode)
-
-        await self.posthook()
-
-    async def posthook(self):
-        bool_one_address = None
+    async def _find_toggle_bools(self) -> tuple[int, int]:
         if not self._is_cached("bool_one_address"):
-            if a := await self.pattern_scan(
-                rb"\x00\xFF\x50\x18\x66\xC7", module="WizardGraphicalClient.exe"
-            ):
-                self._cache("bool_one_address", a)
-                bool_one_address = a
-        else:
-            bool_one_address = self._get_cached("bool_one_address")
-
+            self._cache(
+                "bool_one_address",
+                await self.pattern_scan(
+                    rb"\x00\xFF\x50\x18\x66\xC7", module="WizardGraphicalClient.exe"
+                ),
+            )
         if not self._is_cached("bool_two_address"):
             self._cache("bool_two_address", await self._find_mouse_over_clear())
-        bool_two_address = self._get_cached("bool_two_address")
+        return self._get_cached("bool_one_address"), self._get_cached("bool_two_address")
 
-        if bool_one_address is None:
-            raise RuntimeError("toogle bool address pattern failed")
-
-        self.toggle_bool_addrs = (bool_one_address, bool_two_address)
-
-        await self.write_bytes(bool_one_address, b"\x01")
-        await self.write_bytes(bool_two_address, b"\x01")
-
-        set_cursor_pos = None
+    async def _find_set_cursor_pos(self) -> int:
         if not self._is_cached("SetCursorPos"):
-            if a := await self.get_address_from_symbol("user32.dll", "SetCursorPos"):
-                self._cache("SetCursorPos", a)
-                set_cursor_pos = a
-        else:
-            set_cursor_pos = self._get_cached("SetCursorPos")
-        self.set_cursor_pos = (set_cursor_pos, await self.read_bytes(set_cursor_pos, 6))
-
-        # ret + 5 noops
-        await self.write_bytes(set_cursor_pos, b"\xC3" + (b"\x90" * 5))
+            self._cache(
+                "SetCursorPos",
+                await self.get_address_from_symbol("user32.dll", "SetCursorPos"),
+            )
+        return self._get_cached("SetCursorPos")
 
     async def _find_mouse_over_clear(self) -> int:
         """The address of the immediate the mouse-over flag's clear stores."""

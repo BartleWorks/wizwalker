@@ -1,10 +1,16 @@
+import asyncio
+import ctypes
+import os
 import struct
 from types import SimpleNamespace
 
+import pymem.exception
+import pymem.process
 import pytest
 import regex
 
 from wizwalker import PatternFailed
+from wizwalker.errors import MemoryWriteError
 from wizwalker.memory import hooks
 from wizwalker.memory.handler import HookHandler
 
@@ -381,3 +387,204 @@ async def test_the_mouseless_hook_answers_get_cursor_pos_as_it_would(process, ho
     code = await hooks.MouselessCursorMoveHook(hook_handler).get_hook_bytecode()
     # TRUE in eax, then ret: the caller reads eax as success
     assert code.endswith(b"\xB8\x01\x00\x00\x00\xC3")
+
+
+# --- the mouseless hook's writes, and only its own bytes taken for the originals --
+
+
+GET_CURSOR_POS = 0x7000_0000
+SET_CURSOR_POS = 0x7000_1000
+CLASS_INFO = 0x7000_2000
+_GET_CURSOR_POS_CODE = bytes.fromhex("ba 01 00 00 00 48 ff 25 bc 8b 07 00 cc cc cc cc")
+_SET_CURSOR_POS_CODE = bytes.fromhex("ff 25 62 0c 05 00 cc cc cc cc cc cc cc cc cc cc")
+_TOGGLE_ONE = b"\x00\xFF\x50\x18\x66\xC7"
+# As the hook scans for it: a regex, its escapes written out
+_TOGGLE_ONE_PATTERN = rb"\x00\xFF\x50\x18\x66\xC7"
+
+
+class CursorGame:
+    """user32's three functions the mouseless hook writes into, and the client code holding its two toggles."""
+
+    def __init__(self, process, hook_handler, toggle_one: int, mouse_over: int):
+        self.process = process
+        self.hook_handler = hook_handler
+        self.toggle_one = toggle_one
+        self.mouse_over = mouse_over
+        # What our own user32 holds at an address, standing in for _clean_user32_bytes
+        self.clean: dict[int, bytes] | None = None
+        # Which lookup waits until it is cancelled: a symbol's name, or "the toggle" for its scan
+        self.stall_at: str | None = None
+        self.stalled = asyncio.Event()
+
+    async def stall(self):
+        self.stalled.set()
+        await asyncio.Event().wait()
+
+    def snapshot(self) -> dict[str, bytes]:
+        read = self.process.read_bytes
+        return {
+            "GetCursorPos": read(GET_CURSOR_POS, 16),
+            "SetCursorPos": read(SET_CURSOR_POS, 16),
+            "GetClassInfoExA": read(CLASS_INFO, 256),
+            "toggles": read(self.toggle_one, 1) + read(self.mouse_over, 1),
+        }
+
+    def hook(self) -> hooks.MouselessCursorMoveHook:
+        return hooks.MouselessCursorMoveHook(self.hook_handler)
+
+
+@pytest.fixture
+def cursor_game(process, hook_handler, loaded_function, monkeypatch) -> CursorGame:
+    process.map(GET_CURSOR_POS, _GET_CURSOR_POS_CODE)
+    process.map(SET_CURSOR_POS, _SET_CURSOR_POS_CODE)
+    process.map(CLASS_INFO, bytes(range(256)))
+    gap = b"\xcc" * 4
+    loaded_function(_TOGGLE_ONE + gap + _NEW_MOUSE_OVER_CLEAR)
+    game = CursorGame(process, hook_handler, toggle_one=JUMP, mouse_over=JUMP + len(_TOGGLE_ONE) + len(gap) + 7)
+
+    symbols = {"GetCursorPos": GET_CURSOR_POS, "SetCursorPos": SET_CURSOR_POS, "GetClassInfoExA": CLASS_INFO}
+    scan = hooks.MemoryReader.pattern_scan
+
+    async def symbol(self, module_name, symbol_name, **kwargs):
+        if symbol_name == game.stall_at:
+            await game.stall()
+        return symbols[symbol_name]
+
+    async def stalling_scan(self, pattern, **kwargs):
+        if game.stall_at == "the toggle" and pattern == _TOGGLE_ONE_PATTERN:
+            await game.stall()
+        return await scan(self, pattern, **kwargs)
+
+    def clean(process, address, size):
+        if game.clean is None:
+            return None
+        base = max((b for b in game.clean if b <= address), default=None)
+        return None if base is None else game.clean[base][address - base : address - base + size]
+
+    monkeypatch.setattr(hooks.MemoryReader, "get_address_from_symbol", symbol)
+    monkeypatch.setattr(hooks.MemoryReader, "pattern_scan", stalling_scan)
+    # raising=False, so the tests also run against a hook that has no clean copy to read
+    monkeypatch.setattr(hooks, "_clean_user32_bytes", clean, raising=False)
+    return game
+
+
+async def test_the_mouseless_hook_writes_its_four_patches_and_unhooking_takes_them_all_out(cursor_game):
+    before = cursor_game.snapshot()
+    hook = cursor_game.hook()
+
+    await hook.hook()
+
+    hooked = cursor_game.snapshot()
+    assert decode_jmp(hooked["GetCursorPos"], GET_CURSOR_POS) == CLASS_INFO
+    assert hooked["GetCursorPos"][5:] == before["GetCursorPos"][5:]
+    assert hooked["GetClassInfoExA"][:50] != before["GetClassInfoExA"][:50]
+    assert hooked["toggles"] == b"\x01\x01"
+    assert hooked["SetCursorPos"][:6] == b"\xC3" + b"\x90" * 5
+
+    await hook.unhook()
+
+    assert cursor_game.snapshot() == before
+
+
+@pytest.mark.parametrize("lookup", ["the toggle", "SetCursorPos"])
+async def test_a_mouseless_hook_cancelled_at_a_lookup_has_written_nothing(cursor_game, lookup):
+    # Both used to come after the jump was written, so a cancel there left it in the game
+    # with nothing recorded to take it out
+    before = cursor_game.snapshot()
+    cursor_game.stall_at = lookup
+
+    task = asyncio.create_task(cursor_game.hook().hook())
+    await cursor_game.stalled.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cursor_game.snapshot() == before
+
+
+async def test_a_mouseless_hook_whose_last_write_fails_puts_back_what_it_wrote(cursor_game, monkeypatch):
+    before = cursor_game.snapshot()
+    write = cursor_game.process.write_bytes
+
+    def refuse_the_ret(address, value, size):
+        if address == SET_CURSOR_POS and value.startswith(b"\xC3"):
+            raise pymem.exception.MemoryWriteError(address, value)
+        write(address, value, size)
+
+    monkeypatch.setattr(cursor_game.process, "write_bytes", refuse_the_ret)
+
+    with pytest.raises(MemoryWriteError):
+        await cursor_game.hook().hook()
+
+    assert cursor_game.snapshot() == before
+
+
+async def _leave_a_leftover(game: CursorGame) -> dict[str, bytes]:
+    """The game as P2's was found: GetCursorPos jumping to hook code left in GetClassInfoExA, the rest put back."""
+    clean = game.snapshot()
+    leaked = game.hook()
+    await leaked.hook()
+    leftover = game.snapshot()
+    await leaked.unhook()
+    game.process.write_bytes(GET_CURSOR_POS, leftover["GetCursorPos"], 16)
+    game.process.write_bytes(CLASS_INFO, leftover["GetClassInfoExA"], 256)
+    return clean
+
+
+async def test_a_hooks_leftovers_are_not_taken_for_the_originals(cursor_game):
+    clean = await _leave_a_leftover(cursor_game)
+    cursor_game.clean = {
+        GET_CURSOR_POS: clean["GetCursorPos"],
+        SET_CURSOR_POS: clean["SetCursorPos"],
+        CLASS_INFO: clean["GetClassInfoExA"],
+    }
+
+    hook = cursor_game.hook()
+    await hook.hook()
+    await hook.unhook()
+
+    assert cursor_game.snapshot() == clean
+
+
+async def test_without_a_clean_copy_of_user32_the_games_own_bytes_are_the_originals(cursor_game):
+    await _leave_a_leftover(cursor_game)
+    left = cursor_game.snapshot()
+
+    hook = cursor_game.hook()
+    await hook.hook()
+    await hook.unhook()
+
+    assert cursor_game.snapshot() == left
+
+
+# --- user32 as this process has it ------------------------------------------------
+
+
+@pytest.fixture
+def own_user32():
+    """A handle to this process, user32's base in it, and where its GetCursorPos is."""
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+    user32 = ctypes.WinDLL("user32")
+    get_cursor_pos = ctypes.cast(user32.GetCursorPos, ctypes.c_void_p).value
+    handle = pymem.process.open(os.getpid())
+    yield handle, kernel32.GetModuleHandleW("user32.dll"), get_cursor_pos
+    pymem.process.close_handle(handle)
+
+
+def test_our_own_user32_is_read_at_the_games_address_while_the_bases_match(own_user32):
+    handle, _, get_cursor_pos = own_user32
+    found = hooks._clean_user32_bytes(SimpleNamespace(process_handle=handle), get_cursor_pos, 5)
+    assert found == ctypes.string_at(get_cursor_pos, 5)
+
+
+def test_our_own_user32_is_not_read_for_a_game_that_loads_it_elsewhere(own_user32, monkeypatch):
+    handle, base, get_cursor_pos = own_user32
+    elsewhere = SimpleNamespace(lpBaseOfDll=base + 0x10_0000, SizeOfImage=0x20_0000)
+    monkeypatch.setattr(hooks.pymem.process, "module_from_name", lambda *args: elsewhere)
+    assert hooks._clean_user32_bytes(SimpleNamespace(process_handle=handle), get_cursor_pos, 5) is None
+
+
+def test_our_own_user32_is_not_read_outside_it(own_user32):
+    handle, base, _ = own_user32
+    assert hooks._clean_user32_bytes(SimpleNamespace(process_handle=handle), base - 0x1000, 5) is None
