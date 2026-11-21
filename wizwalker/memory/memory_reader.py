@@ -2,8 +2,11 @@ import asyncio
 import functools
 import regex
 import struct
+import threading
+import weakref
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, NamedTuple, Union
 
 import pefile
 import pymem
@@ -26,6 +29,76 @@ from wizwalker import (
 # Export tables by DLL path. A system DLL's exports are the same for every process,
 # so one table serves every client.
 _SYMBOL_TABLES: dict[str, dict[str, int]] = {}
+
+
+class _ModuleMatch(NamedTuple):
+    """One module scan result, as an offset from the module's base.
+
+    `before` and `after` are how many bytes around it a check reads: enough context
+    for a lookbehind, and a window the pattern matched in completely.
+    """
+
+    offset: int
+    before: int
+    after: int
+
+
+# Module scan results by (module name, build, pattern, return_multiple). Every client
+# of one build runs the same image, so a code pattern sits at the same offset from
+# the module's base in each: only the base moves. A hit is checked in the client at
+# hand before it is used, so a hooked site or a match in data that differs between
+# processes is scanned for again.
+_MODULE_SCANS: OrderedDict[tuple, tuple[_ModuleMatch, ...]] = OrderedDict()
+_MODULE_SCANS_LOCK = threading.Lock()
+# A key per pattern a build is scanned for, so a few dozen; the bound only keeps a
+# session that sees many builds or patterns from growing without end
+_MODULE_SCAN_LIMIT = 256
+# Checking a hit costs a read per result, so a pattern with more results than this
+# (instance_finder's every jmp) is cheaper to scan for again
+_MAX_CACHED_RESULTS = 64
+# How much before a result a check reads, for a lookbehind
+_CONTEXT_BEFORE = 0x100
+# The windows after a result tried in turn, until the pattern matches completely in one
+_MATCH_WINDOWS = (0x40, 0x100, 0x400, 0x1000)
+# The headers' page, which holds the PE fields the build is told by
+_HEADER_SIZE = 0x1000
+
+# The scan running for each key, as {loop: {key: event}}: an asyncio.Event belongs to
+# one loop, and a loop that is gone takes its entry with it
+_IN_FLIGHT: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def clear_module_scan_cache():
+    """
+    Forget every module scan result remembered across clients
+    """
+    with _MODULE_SCANS_LOCK:
+        _MODULE_SCANS.clear()
+
+
+def _cached_module_scan(key: tuple) -> tuple[_ModuleMatch, ...] | None:
+    with _MODULE_SCANS_LOCK:
+        matches = _MODULE_SCANS.get(key)
+        if matches is not None:
+            _MODULE_SCANS.move_to_end(key)
+        return matches
+
+
+def _cache_module_scan(key: tuple, matches: tuple[_ModuleMatch, ...]):
+    with _MODULE_SCANS_LOCK:
+        # An entry already there was checked good in some client; one client's
+        # different answer is no reason to take it from the others
+        if key in _MODULE_SCANS:
+            return
+        _MODULE_SCANS[key] = matches
+        while len(_MODULE_SCANS) > _MODULE_SCAN_LIMIT:
+            _MODULE_SCANS.popitem(last=False)
+
+
+def _in_flight_scans() -> dict[tuple, asyncio.Event]:
+    loop = asyncio.get_running_loop()
+    with _MODULE_SCANS_LOCK:
+        return _IN_FLIGHT.setdefault(loop, {})
 
 
 class MemoryReader:
@@ -149,6 +222,161 @@ class MemoryReader:
 
         return found
 
+    def _module_build(self, module) -> tuple | None:
+        """
+        What tells this module's build from another's, read from its PE headers here,
+        or None if they can't be read
+        """
+        # The headers in memory describe the image this process runs. The file on disk
+        # doesn't: the patcher can replace it while older clients still run the old one.
+        try:
+            header = self.process.read_bytes(module.lpBaseOfDll, _HEADER_SIZE)
+        except Exception:
+            # Not a module whose headers can be read, so not one to cache for
+            return None
+
+        if header[:2] != b"MZ":
+            return None
+        (nt_headers,) = struct.unpack_from("<I", header, 0x3C)
+        optional_header = nt_headers + 24
+        if optional_header + 68 > len(header):
+            return None
+        if header[nt_headers : nt_headers + 4] != b"PE\0\0":
+            return None
+
+        # The linker stamps TimeDateStamp anew for each build (the link time, as the
+        # game's is, or a hash of the image under /Brepro), and the rest change with
+        # nearly any change to the code. The loader rewrites ImageBase, so nothing is
+        # taken that differs between clients of one build.
+        machine, _, time_date_stamp = struct.unpack_from("<HHI", header, nt_headers + 4)
+        (entry_point,) = struct.unpack_from("<I", header, optional_header + 16)
+        size_of_image, _, checksum = struct.unpack_from("<III", header, optional_header + 56)
+        return machine, time_date_stamp, checksum, size_of_image, entry_point
+
+    def _module_matches(
+        self, module, pattern: bytes, found: list[int]
+    ) -> tuple[_ModuleMatch, ...] | None:
+        """
+        A scan's results as offsets a client of the same build can check, or None if
+        they're not worth caching or can't be checked by a read at each
+        """
+        if len(found) > _MAX_CACHED_RESULTS:
+            return None
+
+        compiled = regex.compile(pattern, regex.DOTALL)
+        base = module.lpBaseOfDll
+        end = base + module.SizeOfImage
+
+        matches = []
+        for address in found:
+            if not base <= address < end:
+                return None
+            before = min(_CONTEXT_BEFORE, address - base)
+            for window in _MATCH_WINDOWS:
+                after = min(window, end - address)
+                try:
+                    data = self.process.read_bytes(address - before, before + after)
+                except Exception:
+                    return None
+                match = compiled.match(data, before, partial=True)
+                if match is None:
+                    # The match needs more than the read shows, such as a lookbehind
+                    # reaching further back: leave it to a scan, every time
+                    return None
+                if not match.partial:
+                    break
+                if after < window:
+                    # Still unfinished at the module's end
+                    return None
+            else:
+                return None
+            matches.append(_ModuleMatch(address - base, before, after))
+
+        return tuple(matches)
+
+    def _checked_module_matches(
+        self, module, pattern: bytes, matches: tuple[_ModuleMatch, ...]
+    ) -> list[int] | None:
+        """
+        A cached scan's results as addresses in this process, or None unless the
+        pattern still matches at every one of them
+        """
+        compiled = regex.compile(pattern, regex.DOTALL)
+        base = module.lpBaseOfDll
+
+        found = []
+        for match in matches:
+            address = base + match.offset
+            try:
+                data = self.process.read_bytes(address - match.before, match.before + match.after)
+            except Exception:
+                return None
+            # A hook's jump replaces the bytes it was found by
+            if compiled.match(data, match.before) is None:
+                return None
+            found.append(address)
+
+        return found
+
+    async def _scan_module(self, module, pattern: bytes) -> list[int]:
+        # this can take a long time to run when collecting multiple results
+        # so must be run in an executor
+        return await self.run_in_executor(
+            self._scan_entire_module,
+            self.process.process_handle,
+            module,
+            pattern,
+        )
+
+    def _remember_module_scan(
+        self, key: tuple, module, pattern: bytes, found: list[int], return_multiple: bool
+    ):
+        # Never a failure: no result, or more than one where one was asked for
+        if not found or (len(found) > 1 and not return_multiple):
+            return
+        if (matches := self._module_matches(module, pattern, found)) is not None:
+            _cache_module_scan(key, matches)
+
+    async def _scan_module_cached(
+        self, module_name: str, module, pattern: bytes, return_multiple: bool
+    ) -> list[int]:
+        """
+        A module scan, from the results a client of the same build found when they
+        still match here
+        """
+        build = self._module_build(module) if isinstance(pattern, bytes) else None
+        if build is None:
+            return await self._scan_module(module, pattern)
+
+        key = (module_name.lower(), build, pattern, return_multiple)
+        matches = _cached_module_scan(key)
+
+        if matches is None:
+            in_flight = _in_flight_scans()
+            if (scanning := in_flight.get(key)) is not None:
+                # Another client is scanning for it already: its results, checked
+                # here, save this one the scan
+                await scanning.wait()
+                matches = _cached_module_scan(key)
+            else:
+                in_flight[key] = scanning = asyncio.Event()
+                try:
+                    found = await self._scan_module(module, pattern)
+                    self._remember_module_scan(key, module, pattern, found, return_multiple)
+                    return found
+                finally:
+                    del in_flight[key]
+                    scanning.set()
+
+        if matches is not None:
+            found = self._checked_module_matches(module, pattern, matches)
+            if found is not None:
+                return found
+
+        found = await self._scan_module(module, pattern)
+        self._remember_module_scan(key, module, pattern, found, return_multiple)
+        return found
+
     async def pattern_scan(
         self, pattern: bytes, *, module: str = None, return_multiple: bool = False
     ) -> Union[list, int]:
@@ -173,13 +401,8 @@ class MemoryReader:
             if module_object is None:
                 raise ValueError(f"{module} module not found.")
 
-            # this can take a long time to run when collecting multiple results
-            # so must be run in an executor
-            found_addresses = await self.run_in_executor(
-                self._scan_entire_module,
-                self.process.process_handle,
-                module_object,
-                pattern,
+            found_addresses = await self._scan_module_cached(
+                module, module_object, pattern, return_multiple
             )
 
         else:

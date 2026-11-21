@@ -1,9 +1,18 @@
 import pytest
 
 from wizwalker.memory.handler import HookHandler
-from wizwalker.memory.memory_reader import MemoryReader
+from wizwalker.memory.memory_reader import MemoryReader, clear_module_scan_cache
 
 from .fakes import FakeProcess
+
+
+@pytest.fixture(autouse=True)
+def no_module_scans_from_other_tests():
+    # Module scan results are kept for every reader in the process, and the fakes
+    # lay out the same module at the same base in test after test
+    clear_module_scan_cache()
+    yield
+    clear_module_scan_cache()
 
 
 @pytest.fixture
