@@ -46,6 +46,12 @@ class ClientDeckBehavior(DynamicBehaviorInstance):
                                       +0xA8: length (size_t)
                                       +0xB0: capacity (size_t, >= 16 means heap-allocated)
         m_archmasterySchool        at +0xB8 (184) -- uint32
+
+    Past the reflected fields (measured on four live clients, r814353, 2026-11-21, by
+    renaming a deck and comparing its bytes: BartleBuddy's tools/probe_combat_facts.py):
+        the name's class wheel     at +0xF0 (240) -- uint32, N of DeckNames.lang's Class_N
+        the name's type wheel      at +0xF4 (244) -- uint32, N of its Type_N
+        the name's number wheel    at +0xF8 (248) -- uint32, N of its Num_N
     """
 
     async def spell_list(self) -> List[SpellData]:
@@ -59,6 +65,16 @@ class ClientDeckBehavior(DynamicBehaviorInstance):
     async def archmastery_school(self) -> int:
         """Read m_archmasterySchool."""
         return await self.read_value_from_offset(184, Primitive.uint32)  # 0xB8
+
+    async def name_indices(self) -> Tuple[int, int, int]:
+        """The wheels the deck's name was picked from, as (class, type, number).
+
+        Each is the N of DeckNames.lang's Class_N, Type_N or Num_N, 0 being the wheel's
+        empty choice. A deck never named reads (0, 0, 0), and the game shows it by its
+        item's own name. Not reflected: see the class docstring.
+        """
+        base = await self.read_base_address()
+        return struct.unpack("<III", await self.read_bytes(base + 0xF0, 12))
 
     async def exclusion_list(self) -> List[Tuple[int, int]]:
         """Read m_serializedExclusionList and parse the binary format.
