@@ -168,7 +168,10 @@ class Window(PropertyClass):
             if type_name != "SpellCheckBox":
                 raise ValueError(f"This object is a {type_name} not a SpellCheckBox.")
 
-        addr = await self.read_value_from_offset(1104, Primitive.int64)
+        # Unreflected, after ControlCheckBox's m_pCheckedDepressedState. Every offset from
+        # ControlButton's unreflected block on (the 52 bytes after m_labelOffset) moved +8 in
+        # r815378, this one 1104 to 1112, found by the GraphicalSpell type name at it.
+        addr = await self.read_value_from_offset(1112, Primitive.int64)
 
         if addr == 0:
             return None
@@ -176,7 +179,8 @@ class Window(PropertyClass):
         return DynamicGraphicalSpell(self.hook_handler, addr)
 
     async def maybe_checked(self) -> bool:
-        return await self.read_value_from_offset(1028, Primitive.bool)
+        # ControlCheckBox.m_bChecked, 1044 since r815378 (1036 before, and this read 1028)
+        return await self.read_value_from_offset(1044, Primitive.bool)
 
     # see maybe_graphical_spell
     # note: not defined
@@ -186,7 +190,8 @@ class Window(PropertyClass):
             if type_name != "SpellCheckBox":
                 raise ValueError(f"This object is a {type_name} not a SpellCheckBox")
 
-        return await self.read_value_from_offset(1208, Primitive.bool)
+        # Unreflected; 1208 until r815378 moved SpellCheckBox's own members +8
+        return await self.read_value_from_offset(1216, Primitive.bool)
 
     # See maybe_graphical_spell
     async def maybe_combat_participant(self, *, check_type: bool = False) -> Optional[DynamicCombatParticipant]:
@@ -197,7 +202,9 @@ class Window(PropertyClass):
                     f"This object is a {type_name} not a CombatantDataControl."
                 )
 
-        addr = await self.read_value_from_offset(1888, Primitive.int64)
+        # CombatantDataControl has no reflected class. 1888 until r815378, which moved it +8
+        # with ControlButton's members; found by the ClientCombatParticipant type name at it.
+        addr = await self.read_value_from_offset(1896, Primitive.int64)
 
         if addr == 0:
             return None
